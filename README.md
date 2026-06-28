@@ -124,6 +124,10 @@ UAssetTool create_mod_iostore "output/MyMod" --obfuscate "my_mod.pak"
 
 # Without compression (faster, larger files)
 UAssetTool create_mod_iostore "output/MyMod" --no-compress "my_mod.pak"
+
+# Hybrid bundle: Unreal assets go into the IoStore, everything else (audio, raw
+# .png, .bin, ...) is embedded into the companion PAK as loose files
+UAssetTool create_mod_iostore "output/MyMod" --hybrid "my_mixed_mod.pak"
 ```
 
 **Options:**
@@ -134,11 +138,14 @@ UAssetTool create_mod_iostore "output/MyMod" --no-compress "my_mod.pak"
 - `--obfuscate` - Encrypt with game's AES key to prevent FModel extraction
 - `--pak-aes <hex>` - AES key for decrypting encrypted input `.pak` files
 - `--no-material-tags` - Disable automatic MaterialTag injection
+- `--hybrid` - Embed non-Unreal files as loose entries in the companion PAK instead of dropping them (see below)
+
+**Hybrid bundles:** By default `create_mod_iostore` only handles the Unreal family (`.uasset`, `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.ushaderbytecode`) and silently skips everything else. With `--hybrid`, any other file found in the input PAK/folder (e.g. `.bnk`/`.wem` audio, raw `.png`, `.bin`) is written into the companion PAK at its original relative path so the game mounts it directly. Raw files are not listed in `chunknames`.
 
 **Output files** (copy all three to `~mods`):
 - `<output>.utoc` - Table of Contents
 - `<output>.ucas` - Container Archive Store
-- `<output>.pak` - Companion PAK with chunk names
+- `<output>.pak` - Companion PAK with chunk names (and, in hybrid mode, loose non-Unreal files)
 
 **Marvel Rivals auto-fixes applied during conversion:**
 - **SkeletalMesh**: FGameplayTagContainer padding, MaterialTag injection
@@ -562,6 +569,7 @@ The `batch_extract_texture_png` action processes all files in `file_paths`, outp
 **Mod Creation**
 ```json
 {"action": "create_mod_iostore", "output_path": "...", "input_dir": "...", "usmap_path": "...", "obfuscate": true}
+{"action": "create_mod_iostore", "output_path": "...", "input_pak": "...", "hybrid": true}
 {"action": "clone_mod_iostore", "file_path": "...", "output_path": "..."}
 ```
 

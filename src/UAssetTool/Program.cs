@@ -147,7 +147,7 @@ public partial class Program
         Console.WriteLine("               --usmap <path>               - Path to usmap file");
         Console.WriteLine();
         Console.WriteLine("  Mod Creation (Legacy -> IoStore):");
-        Console.WriteLine("    create_mod_iostore <output> <inputs...>  - Convert legacy assets and create IoStore bundle");
+        Console.WriteLine("    create_mod_iostore <output> <inputs...>  - Convert legacy assets and create IoStore bundle (add --hybrid to embed non-Unreal files in the companion PAK)");
         Console.WriteLine("    to_zen <uasset> [--no-material-tags] - Convert legacy to Zen format");
         Console.WriteLine("    create_pak <output.pak> <files...>       - Create encrypted PAK file");
         Console.WriteLine("    create_companion_pak <output.pak> <files...> - Create companion PAK for IoStore");
@@ -400,6 +400,21 @@ public partial class Program
         return Path.GetFileName(absPath);
     }
 
+    /// <summary>
+    /// Extensions that belong to the "immediate Unreal family" — packages, their bulk siblings,
+    /// and shader libraries. These are routed into the IoStore (.ucas) by create_mod_iostore.
+    /// Anything NOT in this set is considered a raw/loose file for hybrid bundles
+    /// (e.g. .bnk, .wem, .png, .bin, .json, .locres) and goes into the companion PAK directly.
+    /// Note: ".m.ubulk" resolves to a ".ubulk" extension via Path.GetExtension, so it is covered.
+    /// </summary>
+    private static readonly HashSet<string> UnrealFamilyExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".uasset", ".umap", ".uexp", ".ubulk", ".uptnl", ".ushaderbytecode"
+    };
+
+    private static bool IsUnrealFamilyFile(string path)
+        => UnrealFamilyExtensions.Contains(Path.GetExtension(path));
+
     private static int CliCreateCompanionPak(string[] args)
     {
         if (args.Length < 3)
@@ -616,6 +631,8 @@ public partial class Program
             Console.Error.WriteLine("  --obfuscate           - Protect mod from extraction tools like FModel");
             Console.Error.WriteLine("  --pak-aes <hex>       - AES key for decrypting input .pak files");
             Console.Error.WriteLine("  --no-material-tags    - Disable MaterialTag injection (enabled by default)");
+            Console.Error.WriteLine("  --hybrid              - Embed non-Unreal files (audio, raw .png, .bin, ...) as");
+            Console.Error.WriteLine("                          loose entries in the companion PAK instead of dropping them");
             return 1;
         }
 
@@ -628,8 +645,13 @@ public partial class Program
         string? pakAesKey = null;
         // Marvel Rivals AES key for obfuscation
         const string MARVEL_RIVALS_AES_KEY = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
+        // Pre-scan for --hybrid so it applies no matter where it appears relative to inputs
+        // (inputs are processed inline as the arg loop encounters them).
+        bool hybrid = args.Any(a => a.Equals("--hybrid", StringComparison.OrdinalIgnoreCase));
         var uassetFiles = new List<string>();
         var shaderBytecodeFiles = new List<string>();
+        // Hybrid raw files: (in-PAK relative path, absolute path on disk).
+        var rawFiles = new List<(string inPakPath, string absPath)>();
         var tempDirsToCleanup = new List<string>();
 
         for (int i = 2; i < args.Length; i++)
@@ -663,6 +685,10 @@ public partial class Program
             {
                 pakAesKey = args[++i];
             }
+            else if (args[i] == "--hybrid")
+            {
+                // Already handled by the pre-scan above; consume here so it isn't treated as input.
+            }
             else if (args[i].EndsWith(".pak", StringComparison.OrdinalIgnoreCase) && File.Exists(args[i]))
             {
                 // Extract legacy assets from .pak file to temp directory
@@ -678,9 +704,9 @@ public partial class Program
                     int extracted = 0;
                     foreach (var file in pakReader.Files)
                     {
-                        // Only extract .uasset, .uexp, .ubulk, and .ushaderbytecode files
-                        string ext = Path.GetExtension(file).ToLowerInvariant();
-                        if (ext != ".uasset" && ext != ".uexp" && ext != ".ubulk" && ext != ".ushaderbytecode")
+                        // Only extract the Unreal family — UNLESS hybrid mode is on, in which case
+                        // extract everything so non-Unreal files can be embedded into the companion PAK.
+                        if (!hybrid && !IsUnrealFamilyFile(file))
                             continue;
 
                         byte[] data = pakReader.Get(file);
@@ -708,6 +734,19 @@ public partial class Program
                         shaderBytecodeFiles.Add(Path.GetFullPath(f));
                     if (shaderDirFiles.Length > 0)
                         Console.Error.WriteLine($"[CreateModIoStore]   Found {shaderDirFiles.Length} .ushaderbytecode files");
+
+                    // Hybrid: collect every extracted non-Unreal file for the companion PAK.
+                    if (hybrid)
+                    {
+                        int rawBefore = rawFiles.Count;
+                        foreach (var f in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
+                        {
+                            if (IsUnrealFamilyFile(f)) continue;
+                            string rel = Path.GetRelativePath(tempDir, f).Replace('\\', '/');
+                            rawFiles.Add((rel, Path.GetFullPath(f)));
+                        }
+                        Console.Error.WriteLine($"[CreateModIoStore]   Found {rawFiles.Count - rawBefore} raw (non-Unreal) files");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -738,10 +777,36 @@ public partial class Program
                     shaderBytecodeFiles.Add(Path.GetFullPath(f));
                 if (shaderDirFiles.Length > 0)
                     Console.Error.WriteLine($"Found {shaderDirFiles.Length} .ushaderbytecode files in directory: {args[i]}");
+
+                // Hybrid: collect every non-Unreal file in the directory for the companion PAK.
+                if (hybrid)
+                {
+                    int rawBefore = rawFiles.Count;
+                    string baseDir = Path.GetFullPath(args[i]);
+                    foreach (var f in Directory.GetFiles(args[i], "*", SearchOption.AllDirectories))
+                    {
+                        if (IsUnrealFamilyFile(f)) continue;
+                        string rel = Path.GetRelativePath(baseDir, Path.GetFullPath(f)).Replace('\\', '/');
+                        rawFiles.Add((rel, Path.GetFullPath(f)));
+                    }
+                    if (rawFiles.Count - rawBefore > 0)
+                        Console.Error.WriteLine($"Found {rawFiles.Count - rawBefore} raw (non-Unreal) files in directory: {args[i]}");
+                }
             }
             else if (File.Exists(args[i]))
             {
-                Console.Error.WriteLine($"Warning: Skipping non-.uasset file: {args[i]}");
+                if (hybrid)
+                {
+                    // Embed an individually-passed non-Unreal file into the companion PAK.
+                    string abs = Path.GetFullPath(args[i]);
+                    string rel = ResolveInPakPath(abs, null);
+                    rawFiles.Add((rel, abs));
+                    Console.Error.WriteLine($"[CreateModIoStore] Hybrid: embedding raw file: {rel}");
+                }
+                else
+                {
+                    Console.Error.WriteLine($"Warning: Skipping non-.uasset file: {args[i]}");
+                }
             }
             else
             {
@@ -749,7 +814,7 @@ public partial class Program
             }
         }
 
-        if (uassetFiles.Count == 0 && shaderBytecodeFiles.Count == 0)
+        if (uassetFiles.Count == 0 && shaderBytecodeFiles.Count == 0 && rawFiles.Count == 0)
         {
             Console.Error.WriteLine("Error: No valid .uasset or .ushaderbytecode files provided");
             return 1;
@@ -932,7 +997,7 @@ public partial class Program
                 }
             }
 
-            if (filePaths.Count == 0)
+            if (filePaths.Count == 0 && rawFiles.Count == 0)
             {
                 Console.Error.WriteLine("Error: No assets were successfully converted");
                 if (errors.Count > 0)
@@ -942,14 +1007,31 @@ public partial class Program
 
             ioStoreWriter.Complete();
 
-            // Create companion PAK
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mountPoint, 0, aesKey);
+            // Read hybrid raw files into memory so they can be embedded into the companion PAK.
+            var rawEntries = new List<(string inPakPath, byte[] data)>();
+            foreach (var (inPakPath, absPath) in rawFiles)
+            {
+                try
+                {
+                    rawEntries.Add((inPakPath, File.ReadAllBytes(absPath)));
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"Raw:{inPakPath}: {ex.Message}");
+                    Console.Error.WriteLine($"  ERROR reading raw file {inPakPath}: {ex.Message}");
+                }
+            }
+
+            // Create companion PAK (with chunknames and any hybrid raw files)
+            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mountPoint, 0, aesKey, rawEntries.Count > 0 ? rawEntries : null);
 
             Console.WriteLine($"SUCCESS: Created IoStore mod bundle:");
             Console.WriteLine($"  {utocPath}");
             Console.WriteLine($"  {Path.ChangeExtension(utocPath, ".ucas")}");
             Console.WriteLine($"  {pakPath}");
             Console.WriteLine($"  Assets converted: {filePaths.Count}");
+            if (rawEntries.Count > 0)
+                Console.WriteLine($"  Raw (hybrid) files in companion PAK: {rawEntries.Count}");
             return 0;
         }
         catch (Exception ex)
@@ -2652,7 +2734,7 @@ public partial class Program
                 "extract_iostore" => ExtractIoStoreJson(request.FilePath, request.OutputPath, request.AesKey),
                 "extract_iostore_legacy" => ExtractIoStoreLegacyJson(request.GamePaks, request.ModPath, request.OutputPath, request.FilterPatterns, request.AesKey, request.WithDeps),
                 "extract_script_objects" => ExtractScriptObjectsJson(request.FilePath, request.OutputPath),
-                "create_mod_iostore" => CreateModIoStoreJson(request.OutputPath, request.InputDir, request.InputPak, request.MountPoint, request.Compress, request.AesKey, request.Parallel, request.Obfuscate),
+                "create_mod_iostore" => CreateModIoStoreJson(request.OutputPath, request.InputDir, request.InputPak, request.MountPoint, request.Compress, request.AesKey, request.Parallel, request.Obfuscate, request.Hybrid),
                 
                 // Additional CLI-equivalent operations for parity
                 "dump" => DumpAssetJson(request.FilePath, request.UsmapPath),
@@ -6568,7 +6650,7 @@ public partial class Program
     /// Converts .uasset/.uexp files to Zen format and creates .utoc/.ucas/.pak bundle.
     /// Supports direct .pak file input (input_pak) as an alternative to input_dir.
     /// </summary>
-    private static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate)
+    private static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate, bool hybrid = false)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
@@ -6607,8 +6689,10 @@ public partial class Program
                 {
                     try
                     {
-                        // Skip non-asset files
-                        if (!file.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
+                        // Skip non-asset files — UNLESS hybrid mode is on, in which case we extract
+                        // everything so non-Unreal files can be embedded into the companion PAK.
+                        if (!hybrid &&
+                            !file.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
                             !file.EndsWith(".uexp", StringComparison.OrdinalIgnoreCase) &&
                             !file.EndsWith(".ubulk", StringComparison.OrdinalIgnoreCase) &&
                             !file.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase))
@@ -6657,8 +6741,22 @@ public partial class Program
 
             // Collect shader bytecode files
             var shaderFiles = Directory.GetFiles(effectiveInputDir, "*.ushaderbytecode", SearchOption.AllDirectories).ToList();
-            
-            if (uassetFiles.Count == 0 && shaderFiles.Count == 0)
+
+            // Hybrid mode: collect every non-Unreal-family file to embed raw into the companion PAK.
+            // Each entry is (in-PAK relative path, absolute path on disk).
+            var rawInputFiles = new List<(string inPakPath, string absPath)>();
+            if (hybrid)
+            {
+                foreach (var f in Directory.EnumerateFiles(effectiveInputDir, "*", SearchOption.AllDirectories))
+                {
+                    if (IsUnrealFamilyFile(f)) continue;
+                    string rel = Path.GetRelativePath(effectiveInputDir, f).Replace('\\', '/');
+                    rawInputFiles.Add((rel, Path.GetFullPath(f)));
+                }
+                Console.Error.WriteLine($"[CreateModIoStore] Hybrid mode: found {rawInputFiles.Count} raw (non-Unreal) file(s) for companion PAK");
+            }
+
+            if (uassetFiles.Count == 0 && shaderFiles.Count == 0 && rawInputFiles.Count == 0)
             {
                 // Cleanup temp dir if we created one
                 if (!string.IsNullOrEmpty(tempExtractDir) && Directory.Exists(tempExtractDir))
@@ -6859,7 +6957,7 @@ public partial class Program
                 }
             }
             
-            if (converted == 0 && shaderLibsConverted == 0)
+            if (converted == 0 && shaderLibsConverted == 0 && rawInputFiles.Count == 0)
             {
                 // Clean up empty files left by IoStoreWriter constructor
                 ioStoreWriter.Dispose();
@@ -6870,11 +6968,26 @@ public partial class Program
                     try { Directory.Delete(tempExtractDir, true); } catch { }
                 return new UAssetResponse { Success = false, Message = $"No assets were converted. Errors: {string.Join("; ", errors)}" };
             }
-            
+
             ioStoreWriter.Complete();
-            
-            // Create companion PAK with chunknames
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mount, 0, aesKey);
+
+            // Read hybrid raw files into memory before temp-dir cleanup so they can be embedded.
+            var rawEntries = new List<(string inPakPath, byte[] data)>();
+            foreach (var (inPakPath, absPath) in rawInputFiles)
+            {
+                try
+                {
+                    rawEntries.Add((inPakPath, File.ReadAllBytes(absPath)));
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"Raw:{inPakPath}: {ex.Message}");
+                    Console.Error.WriteLine($"[CreateModIoStore] Error reading raw file {inPakPath}: {ex.Message}");
+                }
+            }
+
+            // Create companion PAK with chunknames (and any hybrid raw files).
+            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mount, 0, aesKey, rawEntries.Count > 0 ? rawEntries : null);
             
             // Resolve file paths to Marvel/Content/ format for the app
             var resolvedFilePaths = filePaths.Select(p => ResolveGamePathToContent(p)).ToList();
@@ -6896,7 +7009,9 @@ public partial class Program
             return new UAssetResponse
             {
                 Success = true,
-                Message = $"Created IoStore mod bundle with {converted} assets" + (shaderLibsConverted > 0 ? $" and {shaderLibsConverted} shader library(ies)" : ""),
+                Message = $"Created IoStore mod bundle with {converted} assets"
+                    + (shaderLibsConverted > 0 ? $" and {shaderLibsConverted} shader library(ies)" : "")
+                    + (rawEntries.Count > 0 ? $" and {rawEntries.Count} raw file(s) in companion PAK" : ""),
                 Data = new Dictionary<string, object?>
                 {
                     ["utoc_path"] = utocPath,
@@ -6904,6 +7019,7 @@ public partial class Program
                     ["pak_path"] = pakPath,
                     ["converted_count"] = converted,
                     ["file_count"] = filePaths.Count,
+                    ["raw_file_count"] = rawEntries.Count,
                     ["file_paths"] = resolvedFilePaths,
                     ["errors"] = errors.Count > 0 ? errors : null
                 }
@@ -7106,6 +7222,14 @@ public class UAssetRequest
     /// </summary>
     [JsonPropertyName("obfuscate")]
     public bool Obfuscate { get; set; } = false;
+
+    /// <summary>
+    /// Hybrid bundle: route Unreal assets into the IoStore (.ucas) as usual, but embed any
+    /// non-Unreal files (e.g. .bnk/.wem audio, raw .png, .bin) as loose entries in the
+    /// companion PAK so the game mounts them by path directly. (create_mod_iostore only)
+    /// </summary>
+    [JsonPropertyName("hybrid")]
+    public bool Hybrid { get; set; } = false;
     
     /// <summary>
     /// Use compact CUE4Parse-style JSON output (read-only, no roundtrip)

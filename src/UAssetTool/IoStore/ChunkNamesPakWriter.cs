@@ -22,12 +22,19 @@ public static class ChunkNamesPakWriter
     /// <param name="mountPoint">Mount point (default: "../../../")</param>
     /// <param name="pathHashSeed">Path hash seed (default: 0)</param>
     /// <param name="aesKeyHex">AES key in hex format (default: Marvel Rivals key)</param>
+    /// <param name="rawFiles">
+    /// Optional "hybrid" payload: arbitrary (in-PAK path, bytes) pairs to store as real, loose
+    /// file entries inside the companion PAK. Used for non-Unreal assets (e.g. .bnk/.wem audio,
+    /// raw .png, .bin) that the game mounts by path directly rather than through the IoStore.
+    /// These are NOT listed in the "chunknames" manifest.
+    /// </param>
     public static void Create(
         string pakPath,
         IEnumerable<string> filePaths,
         string mountPoint = "../../../",
         ulong pathHashSeed = 0,
-        string? aesKeyHex = null)
+        string? aesKeyHex = null,
+        IEnumerable<(string inPakPath, byte[] data)>? rawFiles = null)
     {
         // Build chunknames content - newline-separated list of relative paths
         string chunkNamesContent = string.Join("\n", filePaths);
@@ -39,11 +46,24 @@ public static class ChunkNamesPakWriter
         // Add the chunknames entry (no compression)
         pakWriter.AddEntry("chunknames", chunkNamesBytes);
 
+        // Add any hybrid raw files as real loose entries alongside chunknames.
+        int rawCount = 0;
+        if (rawFiles != null)
+        {
+            foreach (var (inPakPath, data) in rawFiles)
+            {
+                pakWriter.AddEntry(inPakPath, data);
+                rawCount++;
+            }
+        }
+
         // Write the PAK file
         pakWriter.Write(pakPath);
 
         Console.Error.WriteLine($"[ChunkNamesPakWriter] Created companion PAK: {pakPath}");
         Console.Error.WriteLine($"[ChunkNamesPakWriter]   Files listed: {chunkNamesContent.Split('\n').Length}");
+        if (rawCount > 0)
+            Console.Error.WriteLine($"[ChunkNamesPakWriter]   Raw (hybrid) files embedded: {rawCount}");
     }
 
     /// <summary>

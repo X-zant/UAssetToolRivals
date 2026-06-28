@@ -1068,6 +1068,56 @@ header.EncryptionKeyGuid = _encryptionKeyGuid;  // Zeros, not game's GUID
 
 ---
 
+## Hybrid Bundles (--hybrid argument)
+
+### Overview
+
+**Location:** `Program.cs` - `CliCreateModIoStore()`, `CreateModIoStoreJson()`, `IsUnrealFamilyFile()`; `IoStore/ChunkNamesPakWriter.cs` - `Create()`
+
+By default `create_mod_iostore` only processes the **Unreal family** of files and silently drops everything else. A real mod often also ships non-Unreal payloads — Wwise audio (`.bnk`/`.wem`), raw images (`.png`), config/data (`.bin`, `.json`, `.locres`). The `--hybrid` flag (`"hybrid": true` in JSON) routes those into the companion PAK as real, loose entries instead of dropping them.
+
+- **Unreal family → IoStore (`.ucas`)**: `.uasset`, `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.ushaderbytecode` (`.m.ubulk` resolves to `.ubulk` via `Path.GetExtension`). Classified by `IsUnrealFamilyFile()`.
+- **Everything else → companion PAK (`.pak`)**: written via `PakWriter.AddEntry` at its original input-relative path, so the game mounts it directly by path. These files are **not** listed in the `chunknames` manifest (that manifest only drives IoStore chunk resolution).
+
+### Behavior
+
+- **Flag is off by default** — existing single-IoStore behavior is unchanged.
+- **PAK input**: in hybrid mode the extractor no longer filters to the Unreal family; it extracts every entry to a temp dir, then collects the non-Unreal ones for the companion PAK.
+- **Directory input**: every non-Unreal file under the input directory is collected (relative path preserved).
+- **Individually-passed files (CLI)**: a non-asset file argument is embedded (in-PAK path resolved via the `/Marvel/` anchor in `ResolveInPakPath`) instead of being skipped with a warning.
+- **Raw-only bundles are valid**: if the hybrid input contains non-Unreal files but no convertible assets, the build still succeeds, producing the PAK plus an empty `.utoc`/`.ucas`.
+- **Encryption**: raw entries inherit `PakWriter`'s standard partial-AES encryption (Marvel key), identical to the `chunknames` entry, independent of `--obfuscate`.
+
+### Usage
+
+**CLI:**
+```bash
+UAssetTool create_mod_iostore output input_mixed.pak --hybrid
+```
+
+**JSON Mode:**
+```json
+{"action": "create_mod_iostore", "output_path": "...", "input_pak": "...", "hybrid": true}
+```
+
+The JSON response includes `raw_file_count` alongside `converted_count`.
+
+### Implementation
+
+```csharp
+// Shared classification (Program.cs)
+private static readonly HashSet<string> UnrealFamilyExtensions = new(StringComparer.OrdinalIgnoreCase)
+    { ".uasset", ".umap", ".uexp", ".ubulk", ".uptnl", ".ushaderbytecode" };
+private static bool IsUnrealFamilyFile(string path)
+    => UnrealFamilyExtensions.Contains(Path.GetExtension(path));
+
+// Companion PAK writer accepts optional raw (in-PAK path, bytes) entries
+ChunkNamesPakWriter.Create(pakPath, filePaths, mount, 0, aesKey,
+    rawEntries.Count > 0 ? rawEntries : null);
+```
+
+---
+
 ## Mod Extraction (--mod argument)
 
 ### Overview
