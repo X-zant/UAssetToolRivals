@@ -18,6 +18,9 @@ public class FZenPackageContext : IDisposable
     private readonly ConcurrentDictionary<ulong, CachedPackage> _packageCache = new();
     private readonly object _loadLock = new();
     private readonly Dictionary<ulong, (int ContainerIndex, FIoChunkId ChunkId)> _packageIdToChunk = new();
+    /// Indices of containers loaded with priority, i.e. mod containers (see LoadContainerWithPriority).
+    /// Used to keep a mod's bulk payload lookups from matching the game package it overrides.
+    private readonly HashSet<int> _priorityContainers = new();
     private readonly Dictionary<ulong, string> _packageIdToPath = new(); // PackageId -> full package path
     private readonly Dictionary<ulong, List<ulong>> _packageExportHashes = new(); // PackageId -> list of public export hashes
     private readonly Dictionary<int, List<string>> _containerNameMaps = new(); // ContainerIndex -> global name map
@@ -107,6 +110,8 @@ public class FZenPackageContext : IDisposable
             reader = new IoStoreReader(utocPath, useEncryption ? _aesKey : null);
         int containerIndex = _containers.Count;
         _containers.Add(reader);
+        if (overridePriority)
+            _priorityContainers.Add(containerIndex);
         
         // Determine container version from TOC version
         // Only update from non-priority (game) containers, since mod containers
@@ -579,7 +584,7 @@ public class FZenPackageContext : IDisposable
     /// </summary>
     public byte[]? ReadOptionalBulkData(ulong packageId, int containerIndex = -1)
     {
-        return ReadBulkDataById(packageId, IoStore.EIoChunkType.OptionalBulkData)
+        return ReadBulkDataById(packageId, IoStore.EIoChunkType.OptionalBulkData, containerIndex)
                ?? ReadBulkDataByPath(packageId, ".uptnl", containerIndex);
     }
 
@@ -589,21 +594,37 @@ public class FZenPackageContext : IDisposable
     /// </summary>
     public byte[]? ReadMemoryMappedBulkData(ulong packageId, int containerIndex = -1)
     {
-        return ReadBulkDataById(packageId, IoStore.EIoChunkType.MemoryMappedBulkData)
+        return ReadBulkDataById(packageId, IoStore.EIoChunkType.MemoryMappedBulkData, containerIndex)
                ?? ReadBulkDataByPath(packageId, ".m.ubulk", containerIndex);
     }
 
     /// <summary>
-    /// Find all chunks of a given type sharing a package id across EVERY loaded container, sorted by
-    /// chunk index and concatenated. Returns null if none exist. Used for bulk payloads that may live in
-    /// a different container than the package's ExportBundleData (e.g. *optional High-Res DLC containers).
+    /// True when the payload lookup must not leave <paramref name="sourceContainerIndex"/>.
+    ///
+    /// A mod package overrides a game package and therefore carries the SAME package id. An
+    /// unrestricted lookup would also match the game's chunks for that id, which both leaks the
+    /// game's payload when the mod ships none and concatenates mod + game payloads when it does.
+    /// Game containers keep the cross-container search, because an optional high-res payload
+    /// legitimately lives in a separate *optional container from its ExportBundleData.
     /// </summary>
-    private byte[]? ReadBulkDataById(ulong packageId, IoStore.EIoChunkType chunkType)
+    private bool MustRestrictToSourceContainer(int sourceContainerIndex) =>
+        sourceContainerIndex >= 0 && _priorityContainers.Contains(sourceContainerIndex);
+
+    /// <summary>
+    /// Find all chunks of a given type sharing a package id, sorted by chunk index and concatenated.
+    /// Returns null if none exist. Used for bulk payloads that may live in a different container than
+    /// the package's ExportBundleData (e.g. *optional High-Res DLC containers), so the search spans
+    /// every loaded container — except for mod-sourced packages, which are pinned to their own
+    /// container by MustRestrictToSourceContainer.
+    /// </summary>
+    private byte[]? ReadBulkDataById(ulong packageId, IoStore.EIoChunkType chunkType, int sourceContainerIndex = -1)
     {
         bool debug = Environment.GetEnvironmentVariable("DEBUG_BULK") == "1";
+        bool restrict = MustRestrictToSourceContainer(sourceContainerIndex);
         var parts = new List<(int Container, ushort Index, byte[] Data)>();
         for (int ci = 0; ci < _containers.Count; ci++)
         {
+            if (restrict && ci != sourceContainerIndex) continue;
             var reader = _containers[ci];
             foreach (var chunk in reader.GetChunks())
             {
@@ -693,9 +714,12 @@ public class FZenPackageContext : IDisposable
         if (debug)
             Console.Error.WriteLine($"[DEBUG_BULK] ReadBulkDataByPath: looking for '{bulkRelPath}' across {_containers.Count} containers");
         
-        // Step 3: Search all containers for this file path
+        // Step 3: Search containers for this file path. A mod-sourced package stays inside its own
+        // container (see MustRestrictToSourceContainer); game packages search everywhere.
+        bool restrict = MustRestrictToSourceContainer(containerIndex);
         for (int ci = 0; ci < _containers.Count; ci++)
         {
+            if (restrict && ci != containerIndex) continue;
             var reader = _containers[ci];
             try
             {
