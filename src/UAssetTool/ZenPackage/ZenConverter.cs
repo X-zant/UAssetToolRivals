@@ -517,12 +517,16 @@ public class ZenConverter
             ulong publicExportHash = 0;
             if (isPublic)
             {
-                string exportName = export.ObjectName?.Value?.Value ?? "None";
-                int nameNumber = export.ObjectName?.Number ?? 0;
-                // UE FName with Number > 0 displays as "BaseName_N" where N = Number - 1
-                if (nameNumber > 0)
-                    exportName = exportName + "_" + (nameNumber - 1);
-                publicExportHash = CalculatePublicExportHash(exportName);
+                // Hash the export's path within the package, not just its leaf name. For a
+                // top-level export the two are the same, but a nested export is addressed as
+                // "Outer/Inner", and that is what other packages hash when they import it (see
+                // BuildImportMap, which already resolves imports this way).
+                //
+                // Hashing the leaf alone gave every nested export a hash no importer could
+                // match, so a repacked package broke every reference into it and the game
+                // crashed on load. Blueprints were worst hit because almost all of their
+                // exports are nested: components, SCS nodes and _GEN_VARIABLE objects.
+                publicExportHash = CalculatePublicExportHash(BuildExportPath(asset, export));
             }
 
             // Preserve FilterFlags from legacy export - retoc preserves these and the game expects them
@@ -603,6 +607,51 @@ public class ZenConverter
         if (number > 0)
             return baseName + "_" + (number - 1);
         return baseName;
+    }
+
+    private static string GetExportObjectNameWithNumber(Export export)
+    {
+        string baseName = export.ObjectName?.Value?.Value ?? "None";
+        int number = export.ObjectName?.Number ?? 0;
+        // UE FName with Number > 0 displays as "BaseName_N" where N = Number - 1
+        if (number > 0)
+            return baseName + "_" + (number - 1);
+        return baseName;
+    }
+
+    /// <summary>
+    /// Build an export's path within its own package: "Outer/Inner" for a nested export, or just
+    /// the name for a top-level one. This is the string other packages hash in order to import
+    /// the export, so it has to match how BuildImportMap resolves imports.
+    ///
+    /// Verified against the game's own containers: for 1021001_ChildBP, hashing
+    /// "Default__1021001_ChildBP_C/DeathAnimComponent" reproduces the shipped hash
+    /// 0xDECDE2461CFEE5D7 exactly, while hashing the bare leaf name yields 0xEC1DB5896CAB5944,
+    /// which is what this converter used to emit.
+    /// </summary>
+    private static string BuildExportPath(UAsset asset, Export export)
+    {
+        var parts = new List<string>();
+        var current = export;
+
+        // Bounded so a malformed outer chain cannot spin here.
+        for (int depth = 0; current != null && depth < 64; depth++)
+        {
+            parts.Insert(0, GetExportObjectNameWithNumber(current));
+
+            var outer = current.OuterIndex;
+            // Stop at the package boundary: an outer that is not an export is the package
+            // itself (an import) or null, and the path is relative to the package.
+            if (outer == null || !outer.IsExport())
+                break;
+
+            int outerIndex = outer.Index - 1;
+            current = (outerIndex >= 0 && outerIndex < asset.Exports.Count)
+                ? asset.Exports[outerIndex]
+                : null;
+        }
+
+        return string.Join("/", parts);
     }
 
     /// <summary>
