@@ -6506,12 +6506,24 @@ public partial class Program
             int converted = 0;
             int failed = 0;
             var extractedFiles = new List<string>();
+            var extractedPackages = new HashSet<ulong>();
 
-            foreach (var packageId in packagesToExtract)
+            // Extract one package and return the package ids it imports (empty unless withDeps).
+            // This mirrors CliExtractIoStoreLegacy so both surfaces resolve dependencies the same
+            // way. withDeps used to be accepted here and never read, so every caller that asked for
+            // dependencies — the VFX updater passes with_deps: true — silently got none.
+            List<ulong> ExtractOne(ulong packageId, bool isDependency)
             {
+                var imports = new List<ulong>();
+
+                // Claim the id up front: this dedupes and also terminates import cycles. A package
+                // that fails to convert stays claimed rather than being re-queued forever.
+                if (!extractedPackages.Add(packageId))
+                    return imports;
+
                 string? fullPath = context.GetPackagePath(packageId);
                 var cached = context.GetCachedPackage(packageId);
-                if (cached == null) continue;
+                if (cached == null) return imports;
 
                 string packageName = !string.IsNullOrEmpty(fullPath) ? fullPath : cached.Header.PackageName();
 
@@ -6519,6 +6531,9 @@ public partial class Program
                 {
                     var converter = new ZenPackage.ZenToLegacyConverter(context, packageId);
                     var legacyBundle = converter.Convert();
+
+                    if (withDeps)
+                        imports.AddRange(converter.GetImportedPackageIds());
 
                     // Resolve path and write files (same logic as ExtractIoStoreJson)
                     string relPath = packageName;
@@ -6577,8 +6592,35 @@ public partial class Program
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"[ExtractIoStoreLegacy] Failed to convert {packageName}: {ex.Message}");
+                    string prefix = isDependency ? "[DEP] " : "";
+                    Console.Error.WriteLine($"[ExtractIoStoreLegacy] Failed to convert {prefix}{packageName}: {ex.Message}");
                     failed++;
+                }
+
+                return imports;
+            }
+
+            // Primary pass over the requested packages. Filtering already happened above, so
+            // dependencies pulled in below deliberately bypass it — a dependency will not match
+            // the caller's filter, and dropping it would defeat the point of asking for deps.
+            var pendingDependencies = new HashSet<ulong>();
+            foreach (var packageId in packagesToExtract)
+                foreach (var importId in ExtractOne(packageId, isDependency: false))
+                    if (!extractedPackages.Contains(importId))
+                        pendingDependencies.Add(importId);
+
+            // Walk the dependency closure breadth-first until nothing new appears.
+            if (withDeps && pendingDependencies.Count > 0)
+            {
+                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Extracting {pendingDependencies.Count} dependencies...");
+                while (pendingDependencies.Count > 0)
+                {
+                    var batch = pendingDependencies.ToList();
+                    pendingDependencies.Clear();
+                    foreach (var depId in batch)
+                        foreach (var importId in ExtractOne(depId, isDependency: true))
+                            if (!extractedPackages.Contains(importId))
+                                pendingDependencies.Add(importId);
                 }
             }
 
