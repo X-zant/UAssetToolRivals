@@ -98,28 +98,21 @@ namespace UAssetAPI.ExportTypes.Texture
                 Mips.Add(mip);
             }
 
-            // Check if using UE5.3+ DataResources format
+            // UE5.3+ DataResources mips carry their real dimensions inline (read by
+            // FTexture2DMipMap.Read). Previously they were synthesized as SizeX >> mipIndex
+            // because the mip loop left the stream misaligned and never parsed them; that
+            // guess also desynced everything after it, including bIsVirtual below.
             bool hasDataResources = Mips.Count > 0 && Mips[0].BulkData?.Header?.DataResourceIndex >= 0;
-
-            if (hasDataResources)
-            {
-                // DataResources format: each mip header is just a 4-byte DataResourceIndex.
-                // The pixel data is at DataResource.SerialOffset in .uexp (or .ubulk),
-                // NOT inline in the stream after the headers.
-                // Populate mip dimensions from the header SizeX/SizeY, scaled per mip level.
-                for (int mi = 0; mi < Mips.Count; mi++)
-                {
-                    Mips[mi].SizeX = Math.Max(1, SizeX >> mi);
-                    Mips[mi].SizeY = Math.Max(1, SizeY >> mi);
-                    Mips[mi].SizeZ = 1;
-                }
-            }
 
             // bIsVirtual (int32 as bool) comes right after mip headers
             bIsVirtual = reader.ReadInt32() != 0;
 
-            // Update dimensions from first mip if available (CUE4Parse does this)
-            if (Mips.Count > 0)
+            // Update dimensions from first mip if available (CUE4Parse does this).
+            // NOT valid in the DataResources format: when FirstMipToSerialize > 0 the top
+            // mip levels were dropped at cook time, so Mips[0] is smaller than the texture.
+            // (e.g. a 2048x2048 BC5 whose first serialized mip is 1024x1024). Overwriting
+            // the header with Mips[0] there would shrink the texture on the next write.
+            if (Mips.Count > 0 && !hasDataResources)
             {
                 SizeX = Mips[0].SizeX;
                 SizeY = Mips[0].SizeY;
@@ -149,9 +142,12 @@ namespace UAssetAPI.ExportTypes.Texture
                 writer.Write(new byte[PlaceholderByteCount]);
             }
             
-            // Write dimensions and packed data
-            int writeX = Mips.Count > 0 ? Mips[0].SizeX : SizeX;
-            int writeY = Mips.Count > 0 ? Mips[0].SizeY : SizeY;
+            // Write dimensions and packed data.
+            // In the DataResources format these are the texture's own dimensions, which differ
+            // from Mips[0] whenever FirstMipToSerialize > 0 — see the matching note in Read.
+            bool writeHasDataResources = Mips.Count > 0 && Mips[0].BulkData?.Header?.DataResourceIndex >= 0;
+            int writeX = (Mips.Count > 0 && !writeHasDataResources) ? Mips[0].SizeX : SizeX;
+            int writeY = (Mips.Count > 0 && !writeHasDataResources) ? Mips[0].SizeY : SizeY;
             writer.Write(writeX);
             writer.Write(writeY);
             writer.Write(PackedData);

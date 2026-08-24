@@ -638,11 +638,15 @@ namespace UAssetAPI.ExportTypes.Texture
                     // Write FTexturePlatformData
                     PlatformData.Write(writer);
 
-                    // Update skip offset (int64 for UE5)
-                    // The skip offset is relative from AFTER reading the offset field
+                    // Update skip offset (int64 for UE5).
+                    // UE writes this as Ar.Tell() - SkipOffsetLoc, i.e. measured from the START
+                    // of the offset field, which is what cooked Marvel Rivals textures contain.
+                    // The previous "- 8" produced a value 8 short of what the game ships; it went
+                    // unnoticed because the payload was being dropped entirely, so output was
+                    // never byte-compared against an original.
                     long currentPos = writer.BaseStream.Position;
                     writer.BaseStream.Position = skipOffsetPos;
-                    writer.Write((long)(currentPos - skipOffsetPos - 8));
+                    writer.Write((long)(currentPos - skipOffsetPos));
                     writer.BaseStream.Position = currentPos;
                     
                     // Write "None" FName to terminate the pixel format loop

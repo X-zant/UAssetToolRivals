@@ -49,10 +49,10 @@ namespace UAssetAPI.ExportTypes.Texture
                 return;
             }
 
-            // UE5.3+ DataResources: The header only wrote a 4-byte DataResourceIndex.
-            // The pixel data is NOT at the current stream position — it's serialized after
-            // all mip headers (for inline) or in .ubulk (for external). Don't read here;
-            // FTexturePlatformData.Read() will read inline data from the correct position.
+            // UE5.3+ DataResources: the header only consumed a 4-byte DataResourceIndex.
+            // In this format the payload is interleaved per mip and cannot be read here,
+            // because the caller must decide based on the resolved bulk flags. See
+            // ReadDataResourcePayload, which FTexture2DMipMap.Read calls immediately after.
             if (Header.DataResourceIndex >= 0)
             {
                 Data = Array.Empty<byte>();
@@ -96,6 +96,27 @@ namespace UAssetAPI.ExportTypes.Texture
                 // External data but no ubulk file - store empty
                 Data = Array.Empty<byte>();
             }
+        }
+
+        /// <summary>
+        /// Read the inline pixel payload for the UE5.3+ DataResources format.
+        /// Must be called straight after <see cref="Read"/> consumed the 4-byte
+        /// DataResourceIndex, with the stream sitting on the payload.
+        ///
+        /// Only inline mips carry their bytes here; streaming (.ubulk) and optional (.uptnl)
+        /// mips keep their payload in the sidecar file and are deliberately left with empty
+        /// Data, matching what the writer and TextureInjector expect. The DataResource entry
+        /// for those mips already points at the correct offset inside its own file.
+        /// </summary>
+        public void ReadDataResourcePayload(AssetBinaryReader reader)
+        {
+            if (Header == null || Header.DataResourceIndex < 0) return;
+            if (!Header.IsInline) return;
+
+            long size = Header.ElementCount;
+            if (size <= 0 || size > int.MaxValue) return;
+
+            Data = reader.ReadBytes((int)size);
         }
 
         public void Write(AssetBinaryWriter writer)
