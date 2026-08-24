@@ -1328,7 +1328,15 @@ public class ZenToLegacyConverter
                             ClassName = className,
                             ObjectName = exportBaseName,
                             ObjectNameNumber = exportNumber,
-                            Outer = packageOuter
+                            // Rebuild the object's real outer chain inside the target package rather
+                            // than parenting straight to the package. A nested object is addressed as
+                            // "Outer/Inner", and that path is what the public export hash is computed
+                            // from, so flattening it here silently destroyed the path: repacking then
+                            // hashed the bare leaf and produced an import no package could resolve.
+                            // Correct for top-level objects either way, which is why only nested
+                            // imports (lobby ShowBP/LikeBP referencing components of another
+                            // blueprint's CDO) broke.
+                            Outer = BuildImportOuterChain(targetPackage, export.OuterIndex, packageOuter, 0)
                         };
                     }
                     else
@@ -1423,6 +1431,39 @@ public class ZenToLegacyConverter
             ClassName = className,
             ObjectName = exportName,
             Outer = outer
+        };
+    }
+
+    /// <summary>
+    /// Rebuild the chain of outers for an object imported from another package, so the legacy
+    /// import table mirrors the real hierarchy (package -> CDO -> component) instead of parenting
+    /// every imported object directly to its package.
+    ///
+    /// The chain matters because a public export hash is computed from the object's path within
+    /// its package. Flattening it loses that path, and since the hash cannot be inverted, the
+    /// packer had no way to reconstruct it later.
+    /// </summary>
+    private ResolvedZenImport BuildImportOuterChain(FZenPackageHeader targetPackage, FPackageObjectIndex outerIndex, ResolvedZenImport packageOuter, int depth)
+    {
+        // Anything that is not an export in the target package is the package itself.
+        if (depth > 16 || outerIndex.IsNull() || !outerIndex.IsExport())
+            return packageOuter;
+
+        int idx = (int)outerIndex.GetExportIndex();
+        if (idx < 0 || idx >= targetPackage.ExportMap.Count)
+            return packageOuter;
+
+        var outerExport = targetPackage.ExportMap[idx];
+        var (baseName, number) = GetExportBaseNameAndNumber(targetPackage, outerExport.ObjectName);
+        var (className, classPackage) = ResolveExportClassInfo(targetPackage, outerExport.ClassIndex);
+
+        return new ResolvedZenImport
+        {
+            ClassPackage = classPackage,
+            ClassName = className,
+            ObjectName = baseName,
+            ObjectNameNumber = number,
+            Outer = BuildImportOuterChain(targetPackage, outerExport.OuterIndex, packageOuter, depth + 1)
         };
     }
 
