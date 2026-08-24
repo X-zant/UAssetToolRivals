@@ -7,6 +7,16 @@
   <assembly fullname="System.Private.CoreLib">
     <type fullname="System.Collections.Generic.List`1" preserve="all" />
     <type fullname="System.Collections.Generic.Dictionary`2" preserve="all" />
+  </assembly>
+  <!-- LinkedList`1 / LinkedListNode`1 are defined in System.Collections, not CoreLib. They
+       were previously declared in the block above, where ILC could not resolve them and
+       warned IL2008, so they rooted nothing. They are worth keeping correct: UAssetAPI
+       serializes FUnversionedHeader.Fragments as LinkedList<FFragment>, and
+       UAssetContractResolver registers a factory for that exact instantiation.
+
+       Note these root type *definitions* only. A closed instantiation still needs to be
+       statically reachable for NativeAOT to emit its code - see AotGenericRoots.cs. -->
+  <assembly fullname="System.Collections">
     <type fullname="System.Collections.Generic.LinkedList`1" preserve="all" />
     <type fullname="System.Collections.Generic.LinkedListNode`1" preserve="all" />
   </assembly>
