@@ -3611,8 +3611,12 @@ public partial class Program
     }
     
     /// <summary>
-    /// Check if a texture has inline data (no .ubulk needed).
-    /// Returns true if texture data is stored inline in the .uexp file.
+    /// True when mip 0's payload is stored inline in the .uexp.
+    ///
+    /// NOT a test for "the sidecars are unnecessary": a texture routinely has an inline mip 0
+    /// while its remaining mips still live in .ubulk / .uptnl, so deleting sidecars on the
+    /// strength of this would discard real mip data. Treating it that way is what made
+    /// Repak-X remove .ubulk files that mods had actually shipped.
     /// </summary>
     private static bool CheckTextureHasInlineData(UAsset asset)
     {
@@ -3625,23 +3629,20 @@ public partial class Program
                 {
                     var mip = textureExport.PlatformData.Mips[0];
                     
-                    // Check if the mip has inline data (ForceInlinePayload flag or DataResourceIndex >= 0)
-                    if (mip.BulkData?.Header != null)
+                    // Is mip 0's payload stored inline, rather than in .ubulk / .uptnl?
+                    //
+                    // Header.IsInline is the shared predicate: ForceInlinePayload (0x40) set, and
+                    // none of PayloadInSeperateFile / PayloadAtEndOfFile / OptionalPayload. In the
+                    // UE5.3 DataResources format these flags come from the DataResource's
+                    // LegacyBulkDataFlags, which is what the game itself reads.
+                    //
+                    // This deliberately does NOT test DataResourceIndex >= 0. That only means "this
+                    // is a UE5.3 DataResources texture", which is true of every cooked Marvel Rivals
+                    // texture regardless of where its payload lives — it made this method return
+                    // true unconditionally, including for .ubulk- and .uptnl-backed mips.
+                    if (mip.BulkData?.Header != null && mip.BulkData.Header.IsInline)
                     {
-                        var header = mip.BulkData.Header;
-                        
-                        // ForceInlinePayload = 0x40, SingleUse = 0x08
-                        // Inline textures typically have flags 0x48 (ForceInlinePayload | SingleUse)
-                        bool hasInlineFlag = ((int)header.BulkDataFlags & 0x40) != 0;
-                        
-                        // Also check if DataResourceIndex is valid (UE5.3+ inline data)
-                        bool hasDataResource = header.DataResourceIndex >= 0;
-                        
-                        // If either condition is true, data is inline
-                        if (hasInlineFlag || hasDataResource)
-                        {
-                            return true;
-                        }
+                        return true;
                     }
                     
                     // Also check if mip has actual pixel data stored
