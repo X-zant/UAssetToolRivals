@@ -1583,7 +1583,12 @@ namespace UAssetAPI
         internal int PreloadDependencyOffset;
 
         [JsonProperty]
-        internal int NamesReferencedFromExportDataCount;
+        /// <summary>
+        /// Number of leading name map entries that export data can reference. Entries past this
+        /// point exist only for the import table. AddNameReference extends this whenever a name is
+        /// added, so it always covers names a modder introduces.
+        /// </summary>
+        public int NamesReferencedFromExportDataCount;
         [JsonProperty]
         internal long PayloadTocOffset;
         [JsonProperty]

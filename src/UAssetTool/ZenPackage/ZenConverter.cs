@@ -759,12 +759,29 @@ public class ZenConverter
 
     private static void BuildNameMap(UAsset asset, FZenPackage zenPackage, string gamePath)
     {
-        // Add all names from legacy name map
-        // NOTE: We cannot filter names here because the export data contains FName references
-        // that use indices into this name map. Filtering would break those references.
-        foreach (var fstring in asset.GetNameMapIndexList())
+        // Copy the names export data can reference, and only those.
+        //
+        // Names cannot be *filtered* here: export data addresses them by index, so removing an
+        // entry from the middle would repoint every later reference. Truncating the tail is a
+        // different operation and is safe. The legacy name map is laid out as
+        // [0, NamesReferencedFromExportDataCount) = referenced by export data, followed by
+        // entries that exist purely to name the legacy import table. Zen stores imports as
+        // hashes and keeps imported package names in their own region, so those trailing entries
+        // have no reader on this side and only inflate the header, pushing every subsequent
+        // offset out relative to what the game ships.
+        //
+        // Safe for edited assets too: UAsset.AddNameReference extends
+        // NamesReferencedFromExportDataCount whenever a name is added, so anything a modder
+        // introduces falls inside the boundary rather than being cut off.
+        var legacyNames = asset.GetNameMapIndexList();
+        int nameCount = legacyNames.Count;
+        int referencedCount = asset.NamesReferencedFromExportDataCount;
+        if (referencedCount > 0 && referencedCount < nameCount)
+            nameCount = referencedCount;
+
+        for (int i = 0; i < nameCount; i++)
         {
-            string nameStr = fstring?.Value ?? "None";
+            string nameStr = legacyNames[i]?.Value ?? "None";
             zenPackage.NameMap.Add(nameStr);
         }
         
