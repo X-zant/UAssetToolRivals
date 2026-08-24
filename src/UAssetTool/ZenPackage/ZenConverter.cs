@@ -1194,74 +1194,50 @@ public class ZenConverter
         // For UE5.3+ NoExportInfo version, we create a single export bundle containing all exports
         // Each export gets two entries: Create and Serialize
         // The order must respect dependencies - exports that depend on others must come after
-        
-        // Build dependency map from export dependencies
-        var depsMap = new Dictionary<int, IList<int>>();
-        for (int i = 0; i < asset.Exports.Count; i++)
+
+        // The bundle is a single sequence over 2N nodes: a Create and a Serialize node for each
+        // export. UE's four preload dependency lists constrain the two commands independently,
+        // which is why a package's Create order and Serialize order genuinely differ (a class
+        // must finish serializing before its CDO can be created). Sorting the N exports once and
+        // emitting that order twice cannot express that, so build the real graph.
+        int exportCount = asset.Exports.Count;
+        int CreateNode(int i) => i;
+        int SerializeNode(int i) => exportCount + i;
+
+        var prereq = new List<int>[exportCount * 2];
+        for (int i = 0; i < prereq.Length; i++) prereq[i] = new List<int>();
+
+        void AddEdge(int node, UAssetAPI.UnrealTypes.FPackageIndex dep, bool depIsSerialize)
+        {
+            if (dep == null || !dep.IsExport()) return;
+            int d = dep.Index - 1;
+            if (d < 0 || d >= exportCount) return;
+            prereq[node].Add(depIsSerialize ? SerializeNode(d) : CreateNode(d));
+        }
+
+        for (int i = 0; i < exportCount; i++)
         {
             var export = asset.Exports[i];
-            var deps = new List<int>();
-            
-            // Add dependencies from SerializationBeforeSerializationDependencies
-            if (export.SerializationBeforeSerializationDependencies != null)
-            {
-                foreach (var dep in export.SerializationBeforeSerializationDependencies)
-                {
-                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
-                    {
-                        deps.Add(dep.Index - 1); // Convert to 0-based
-                    }
-                }
-            }
-            
-            // Add dependencies from CreateBeforeSerializationDependencies
-            if (export.CreateBeforeSerializationDependencies != null)
-            {
-                foreach (var dep in export.CreateBeforeSerializationDependencies)
-                {
-                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
-                    {
-                        deps.Add(dep.Index - 1);
-                    }
-                }
-            }
-            
-            // Add dependencies from SerializationBeforeCreateDependencies
-            if (export.SerializationBeforeCreateDependencies != null)
-            {
-                foreach (var dep in export.SerializationBeforeCreateDependencies)
-                {
-                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
-                    {
-                        deps.Add(dep.Index - 1);
-                    }
-                }
-            }
-            
-            // Add dependencies from CreateBeforeCreateDependencies
+
+            // An object cannot be created before its outer exists.
+            if (export.OuterIndex != null && export.OuterIndex.Index > 0)
+                prereq[CreateNode(i)].Add(CreateNode(export.OuterIndex.Index - 1));
+
             if (export.CreateBeforeCreateDependencies != null)
-            {
-                foreach (var dep in export.CreateBeforeCreateDependencies)
-                {
-                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
-                    {
-                        deps.Add(dep.Index - 1);
-                    }
-                }
-            }
-            
-            // Add OuterIndex as dependency (outer must be created before inner)
-            if (export.OuterIndex.Index > 0)
-            {
-                deps.Add(export.OuterIndex.Index - 1);
-            }
-            
-            depsMap[i] = deps.Distinct().ToList();
+                foreach (var d in export.CreateBeforeCreateDependencies) AddEdge(CreateNode(i), d, false);
+            if (export.SerializationBeforeCreateDependencies != null)
+                foreach (var d in export.SerializationBeforeCreateDependencies) AddEdge(CreateNode(i), d, true);
+            if (export.CreateBeforeSerializationDependencies != null)
+                foreach (var d in export.CreateBeforeSerializationDependencies) AddEdge(SerializeNode(i), d, false);
+            if (export.SerializationBeforeSerializationDependencies != null)
+                foreach (var d in export.SerializationBeforeSerializationDependencies) AddEdge(SerializeNode(i), d, true);
+
+            // An export must exist before it can be serialized.
+            prereq[SerializeNode(i)].Add(CreateNode(i));
         }
-        
-        // Topological sort to get load order
-        var sortedOrder = TopologicalSort(Enumerable.Range(0, asset.Exports.Count), depsMap);
-        
+
+        var bundleOrder = KahnSort(prereq);
+
         // Create a single bundle header
         var bundleHeader = new FExportBundleHeader
         {
@@ -1270,53 +1246,67 @@ public class ZenConverter
             EntryCount = (uint)(zenPackage.ExportMap.Count * 2) // Create + Serialize for each export
         };
         zenPackage.ExportBundleHeaders.Add(bundleHeader);
-        
-        // Add Create entries in dependency order, then Serialize entries in same order
-        foreach (int i in sortedOrder)
+
+        foreach (int node in bundleOrder)
         {
-            zenPackage.ExportBundleEntries.Add(new FExportBundleEntry((uint)i, EExportCommandType.Create));
+            if (node < exportCount)
+                zenPackage.ExportBundleEntries.Add(new FExportBundleEntry((uint)node, EExportCommandType.Create));
+            else
+                zenPackage.ExportBundleEntries.Add(new FExportBundleEntry((uint)(node - exportCount), EExportCommandType.Serialize));
         }
-        
-        foreach (int i in sortedOrder)
-        {
-            zenPackage.ExportBundleEntries.Add(new FExportBundleEntry((uint)i, EExportCommandType.Serialize));
-        }
-        
-        // Verbose logging disabled for parallel performance
     }
-    
+
     /// <summary>
-    /// Topological sort - returns items in dependency order (dependencies first)
+    /// Kahn topological sort over the export bundle graph.
+    ///
+    /// Deliberately iterative and cycle-aware. The previous DFS marked nodes visited on entry, so
+    /// on a dependency cycle it emitted a node before its own prerequisites — blueprints always
+    /// cycle (class -> InheritableComponentHandler -> class), which produced bundles that told the
+    /// engine to create an object before its outer existed.
+    ///
+    /// Any node still constrained when the queue empties is part of a cycle; those are appended in
+    /// index order so the bundle stays complete rather than silently losing exports.
     /// </summary>
-    private static List<int> TopologicalSort(IEnumerable<int> items, Dictionary<int, IList<int>> dependencies)
+    private static List<int> KahnSort(List<int>[] prereq)
     {
-        var sorted = new List<int>();
-        var visited = new HashSet<int>();
-        
-        foreach (var item in items)
+        int count = prereq.Length;
+        var indegree = new int[count];
+        var dependents = new List<int>[count];
+        for (int i = 0; i < count; i++) dependents[i] = new List<int>();
+
+        for (int node = 0; node < count; node++)
         {
-            TopologicalSortVisit(item, visited, sorted, dependencies);
-        }
-        
-        return sorted;
-    }
-    
-    private static void TopologicalSortVisit(int item, HashSet<int> visited, List<int> sorted, Dictionary<int, IList<int>> dependencies)
-    {
-        if (visited.Contains(item))
-            return;
-            
-        visited.Add(item);
-        
-        if (dependencies.TryGetValue(item, out var deps))
-        {
-            foreach (var dep in deps)
+            foreach (int p in prereq[node])
             {
-                TopologicalSortVisit(dep, visited, sorted, dependencies);
+                dependents[p].Add(node);
+                indegree[node]++;
             }
         }
-        
-        sorted.Add(item);
+
+        // Sorted set keeps the result deterministic: same asset in, same bundle out.
+        var ready = new SortedSet<int>();
+        for (int node = 0; node < count; node++)
+            if (indegree[node] == 0) ready.Add(node);
+
+        var order = new List<int>(count);
+        while (ready.Count > 0)
+        {
+            int node = ready.Min;
+            ready.Remove(node);
+            order.Add(node);
+
+            foreach (int m in dependents[node])
+                if (--indegree[m] == 0) ready.Add(m);
+        }
+
+        if (order.Count != count)
+        {
+            var emitted = new HashSet<int>(order);
+            for (int node = 0; node < count; node++)
+                if (!emitted.Contains(node)) order.Add(node);
+        }
+
+        return order;
     }
 
     /// <summary>
