@@ -211,6 +211,32 @@ public class IoStoreReader : IDisposable
     /// <summary>
     /// Read a chunk by its chunk ID
     /// </summary>
+    /// <summary>
+    /// Uncompressed size of a chunk, taken straight from the TOC. Costs no I/O and no
+    /// decompression, so it is safe to call for every chunk in a container.
+    /// Returns -1 when the chunk is not present.
+    /// </summary>
+    public long GetChunkSize(FIoChunkId chunkId)
+    {
+        if (!_toc.ChunkIdMap.TryGetValue(chunkId.ToRaw(), out uint tocEntryIndex))
+            return -1;
+
+        return (long)_toc.ChunkOffsetLengths[(int)tocEntryIndex].Length;
+    }
+
+    /// <summary>
+    /// Read at most <paramref name="maxBytes"/> bytes from the start of a chunk, decompressing
+    /// only the blocks needed to cover them. A zen package header sits at the front of its
+    /// chunk, so this reads a header without paying for the export data behind it.
+    /// </summary>
+    public byte[] ReadChunkPrefix(FIoChunkId chunkId, int maxBytes)
+    {
+        if (!_toc.ChunkIdMap.TryGetValue(chunkId.ToRaw(), out uint tocEntryIndex))
+            throw new KeyNotFoundException($"Chunk {chunkId} not found in container {_containerName}");
+
+        return ReadChunkByIndex(tocEntryIndex, maxBytes);
+    }
+
     public byte[] ReadChunk(FIoChunkId chunkId)
     {
         if (!_toc.ChunkIdMap.TryGetValue(chunkId.ToRaw(), out uint tocEntryIndex))
@@ -222,13 +248,18 @@ public class IoStoreReader : IDisposable
     /// <summary>
     /// Read a chunk by its TOC entry index
     /// </summary>
-    public byte[] ReadChunkByIndex(uint tocEntryIndex)
+    public byte[] ReadChunkByIndex(uint tocEntryIndex, int maxBytes = -1)
     {
         EnsureCasOpen();
 
         var offsetAndLength = _toc.ChunkOffsetLengths[(int)tocEntryIndex];
         ulong offset = offsetAndLength.Offset;
         ulong size = offsetAndLength.Length;
+
+        // How many bytes the caller actually wants. Block addressing below still works off the
+        // full chunk size - clamping that would mis-size the destination buffer - so a prefix
+        // read is expressed purely as stopping the decompression loop early.
+        int wanted = maxBytes >= 0 && (ulong)maxBytes < size ? maxBytes : (int)size;
 
         // Helper: thread-safe positional read via RandomAccess
         void ReadAt(long pos, byte[] buf, int bufOffset, int count)
@@ -241,8 +272,8 @@ public class IoStoreReader : IDisposable
         // If no compression blocks, read directly from CAS
         if (_toc.CompressionBlocks.Count == 0)
         {
-            byte[] data = new byte[size];
-            ReadAt((long)offset, data, 0, (int)size);
+            byte[] data = new byte[wanted];
+            ReadAt((long)offset, data, 0, wanted);
             return data;
         }
 
@@ -311,13 +342,17 @@ public class IoStoreReader : IDisposable
             }
 
             cur += uncompressedSize;
+
+            // Prefix read: everything the caller asked for is decompressed, so skip the
+            // remaining blocks entirely.
+            if (cur >= wanted) break;
         }
 
         // Truncate to actual size
-        if (data2.Length != (int)size)
+        if (data2.Length != wanted)
         {
-            byte[] result = new byte[size];
-            Array.Copy(data2, result, (int)size);
+            byte[] result = new byte[wanted];
+            Array.Copy(data2, result, wanted);
             return result;
         }
 

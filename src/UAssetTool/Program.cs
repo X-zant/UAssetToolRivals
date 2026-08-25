@@ -165,7 +165,8 @@ public partial class Program
         Console.WriteLine("    recompress_iostore <utoc_path>           - Recompress IoStore with Oodle");
         Console.WriteLine("    cityhash <path_string>                   - Calculate CityHash64 for a path");
         Console.WriteLine("    clone_mod_iostore <utoc> <output>        - Clone/repackage a mod IoStore");
-        Console.WriteLine("    list_iostore <utoc_path> [--aes <key>]   - List IoStore contents with ubulk status");
+        Console.WriteLine("    list_iostore <utoc_or_dir> [options]     - List IoStore contents with ubulk status");
+        Console.WriteLine("      Options: --filter <pattern>, --types, --game-paks <dir>");
         Console.WriteLine();
         Console.WriteLine("  Localization:");
         Console.WriteLine("    parse_locres <path> [options]             - Parse .locres file(s) to JSON");
@@ -2726,7 +2727,7 @@ public partial class Program
                 "create_companion_pak" => CreateCompanionPakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey),
                 
                 // IoStore operations
-                "list_iostore_files" => ListIoStoreFiles(request.FilePath, request.AesKey),
+                "list_iostore_files" => ListIoStoreFiles(request.FilePath, request.AesKey, request.IncludeTypes, request.ScriptObjectsPath, request.GamePaks, request.TypeFilter),
                 "create_iostore" => CreateIoStoreJson(request.OutputPath, request.InputDir, request.Compress, request.AesKey),
                 "is_iostore_compressed" => IsIoStoreCompressed(request.FilePath),
                 "is_iostore_encrypted" => IsIoStoreEncrypted(request.FilePath),
@@ -5085,18 +5086,190 @@ public partial class Program
         return 0;
     }
 
+    /// <summary>
+    /// Load the script objects needed to name engine classes. They live in the game's
+    /// global.utoc, not in a mod container, so a path has to come from somewhere: an explicit
+    /// ScriptObjects.bin, an explicit Paks directory, or a global.utoc sitting next to (or
+    /// above) the container being listed.
+    /// Returns null when nothing usable is found; the caller reports that rather than failing.
+    /// </summary>
+    private static ZenPackage.ScriptObjectsDatabase? LoadScriptObjectsForListing(
+        string? scriptObjectsPath, string? gamePaks, string containerPath, string? aesKeyHex)
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(scriptObjectsPath) && File.Exists(scriptObjectsPath))
+                return ZenPackage.ScriptObjectsDatabase.Load(scriptObjectsPath);
+
+            // Walk the container's directory and its parents looking for global.utoc. A mod
+            // installed under ~mods sits a couple of levels below the Paks directory that
+            // holds it, so this finds the game's own script objects without being told.
+            var candidates = new List<string>();
+            if (!string.IsNullOrEmpty(gamePaks)) candidates.Add(gamePaks);
+
+            var dir = Directory.Exists(containerPath)
+                ? new DirectoryInfo(containerPath)
+                : new FileInfo(containerPath).Directory;
+            for (int depth = 0; dir != null && depth < 4; depth++, dir = dir.Parent)
+                candidates.Add(dir.FullName);
+
+            foreach (var candidate in candidates)
+            {
+                string globalPath = Path.Combine(candidate, "global.utoc");
+                if (!File.Exists(globalPath)) continue;
+
+                byte[]? scriptObjects = IoStore.IoStoreReader.ExtractScriptObjects(candidate, aesKeyHex);
+                if (scriptObjects != null)
+                    return ZenPackage.ScriptObjectsDatabase.Load(scriptObjects);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ListIoStore] Could not load script objects: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Asset type of a zen package - the class of its top level export, e.g. Texture2D,
+    /// SkeletalMesh or BlueprintGeneratedClass.
+    ///
+    /// Only the package header is read, and the header sits at the front of the chunk, so a
+    /// prefix is enough and the export data behind it never gets decompressed. Most headers
+    /// fit in one compression block; the caller passes a larger prefix when Summary.HeaderSize
+    /// says otherwise.
+    /// </summary>
+    private static string? ResolveZenAssetType(byte[] headerBytes, ZenPackage.ScriptObjectsDatabase? scriptObjects)
+    {
+        if (scriptObjects == null || headerBytes.Length < 64) return null;
+
+        try
+        {
+            var header = ZenPackage.FZenPackageHeader.Deserialize(
+                headerBytes, ZenPackage.EIoContainerHeaderVersion.NoExportInfo);
+
+            if (header.ExportMap == null || header.ExportMap.Count == 0) return null;
+
+            // The asset is a top level export - one with no outer. Nested exports (components,
+            // SCS nodes) all hang off it. Fall back to the first export for the rare package
+            // that has no top level entry at all.
+            var topLevel = header.ExportMap.Where(e => e.OuterIndex.IsNull()).ToList();
+            if (topLevel.Count == 0) topLevel = header.ExportMap.Take(1).ToList();
+
+            // A package can have several top level exports, so one of them has to be picked as
+            // the asset: a level sequence sits next to its director blueprint, and a blueprint
+            // sits next to its class default object.
+            //
+            // The cooker records which one it is. RF_Standalone marks the object that owns the
+            // package - the level sequence carries it, its director does not. Blueprints are
+            // the one shape with no standalone export at all, and there the asset is the
+            // generated class, told apart from its default object by RF_ClassDefaultObject.
+            // Both are flags written into the export map, so nothing here depends on how an
+            // object happens to be named.
+            var candidates = topLevel.Where(e => e.ClassIndex.IsScriptImport()).ToList();
+
+            var main = candidates.FirstOrDefault(e => ((ZenPackage.EObjectFlags)e.ObjectFlags).HasFlag(ZenPackage.EObjectFlags.Standalone))
+                    ?? candidates.FirstOrDefault(e => !((ZenPackage.EObjectFlags)e.ObjectFlags).HasFlag(ZenPackage.EObjectFlags.ClassDefaultObject))
+                    ?? candidates.FirstOrDefault();
+
+            if (main == null)
+            {
+                // Only default objects at top level. Follow the one hop to the class they
+                // point at, which is where the engine class lives.
+                foreach (var candidate in topLevel)
+                {
+                    if (!candidate.ClassIndex.IsExport()) continue;
+
+                    uint classExport = candidate.ClassIndex.ToExportIndex();
+                    if (classExport < header.ExportMap.Count && header.ExportMap[(int)classExport].ClassIndex.IsScriptImport())
+                    {
+                        main = header.ExportMap[(int)classExport];
+                        break;
+                    }
+                }
+            }
+
+            // Anything left names its class in another package - a blueprint class defined
+            // elsewhere, which the export map records only as a hash. Resolving it means
+            // loading that package and walking the import graph, which is exactly the cost
+            // this scan exists to avoid, so report nothing rather than guess. Measured on the
+            // shipped containers this is 7 packages out of 36,997 in Env and 0 of 221,060 in
+            // Character.
+            if (main == null) return null;
+
+            var classObject = scriptObjects.GetScriptObject(main.ClassIndex);
+            return classObject == null ? null : scriptObjects.GetName(classObject.ObjectName);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Read enough of a package chunk to cover its header, then resolve its asset type.
+    /// </summary>
+    private static string? ReadAssetType(
+        IoStore.IoStoreReader reader, IoStore.FIoChunkId exportChunk, ZenPackage.ScriptObjectsDatabase? scriptObjects)
+    {
+        if (scriptObjects == null) return null;
+
+        const int InitialPrefix = 64 * 1024;
+        try
+        {
+            byte[] prefix = reader.ReadChunkPrefix(exportChunk, InitialPrefix);
+            string? type = ResolveZenAssetType(prefix, scriptObjects);
+            if (type != null) return type;
+
+            // Header did not fit in the first prefix. Only pay for a bigger read when the
+            // summary actually says the header is longer.
+            long chunkSize = reader.GetChunkSize(exportChunk);
+            if (chunkSize > InitialPrefix)
+                return ResolveZenAssetType(reader.ReadChunk(exportChunk), scriptObjects);
+        }
+        catch (Exception ex)
+        {
+            if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                Console.Error.WriteLine($"[ReadAssetType] {ex.GetType().Name}: {ex.Message}");
+        }
+
+        return null;
+    }
+
     private static int CliListIoStore(string[] args)
     {
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("Usage: UAssetTool list_iostore <utoc_path_or_dir> [--aes <key>] [--filter <pattern>]");
+            Console.Error.WriteLine("Usage: UAssetTool list_iostore <utoc_path_or_dir> [options]");
             Console.Error.WriteLine("Lists all packages in an IoStore with their chunk types (ExportBundleData, BulkData, etc.)");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Options:");
+            Console.Error.WriteLine("  --aes <key>              - AES key for encrypted containers");
+            Console.Error.WriteLine("  --filter <pattern>       - Only list packages whose path contains this");
+            Console.Error.WriteLine("  --types                  - Also report the asset type of each package");
+            Console.Error.WriteLine("                             (Texture2D, SkeletalMesh, BlueprintGeneratedClass, ...)");
+            Console.Error.WriteLine("                             Off by default: it reads each package header, which");
+            Console.Error.WriteLine("                             the rest of the listing does not need.");
+            Console.Error.WriteLine("  --type <name>            - Only list packages of this asset type. Repeatable,");
+            Console.Error.WriteLine("                             and accepts a comma separated list. Matches the class");
+            Console.Error.WriteLine("                             exactly, so Material selects master materials without");
+            Console.Error.WriteLine("                             pulling in MaterialInstanceConstant. Implies --types.");
+            Console.Error.WriteLine("                             Use unknown to find packages whose type did not resolve.");
+            Console.Error.WriteLine("  --script-objects <path>  - ScriptObjects.bin used to name classes for --types");
+            Console.Error.WriteLine("  --game-paks <dir>        - Game Paks directory to take script objects from");
+            Console.Error.WriteLine("                             (otherwise global.utoc is looked for next to the");
+            Console.Error.WriteLine("                             container and in its parent directories)");
             return 1;
         }
 
         string inputPath = args[1];
         string? aesKey = null;
         string? filterPattern = null;
+        bool includeTypes = false;
+        string? scriptObjectsPath = null;
+        string? gamePaks = null;
+        var typeFilter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -5104,6 +5277,20 @@ public partial class Program
                 aesKey = args[++i];
             else if (args[i] == "--filter" && i + 1 < args.Length)
                 filterPattern = args[++i];
+            else if (args[i] == "--types")
+                includeTypes = true;
+            else if (args[i] == "--type" && i + 1 < args.Length)
+            {
+                // Accepts repeats and comma separated lists. Filtering by type only means
+                // anything once the types are known, so asking for one turns them on.
+                foreach (var name in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    typeFilter.Add(name);
+                includeTypes = true;
+            }
+            else if (args[i] == "--script-objects" && i + 1 < args.Length)
+                scriptObjectsPath = args[++i];
+            else if (args[i] == "--game-paks" && i + 1 < args.Length)
+                gamePaks = args[++i];
         }
 
         try
@@ -5122,6 +5309,17 @@ public partial class Program
             {
                 Console.Error.WriteLine($"Not found: {inputPath}");
                 return 1;
+            }
+
+            // Naming a class means resolving a script import, which needs the script objects
+            // from the game. Load them once for the whole run, and only when asked for types.
+            ZenPackage.ScriptObjectsDatabase? scriptObjects = null;
+            if (includeTypes)
+            {
+                scriptObjects = LoadScriptObjectsForListing(scriptObjectsPath, gamePaks, inputPath, aesKey);
+                if (scriptObjects == null)
+                    Console.Error.WriteLine("[ListIoStore] --types: no script objects found, types will be reported as unknown. "
+                                          + "Pass --game-paks <dir> or --script-objects <path>.");
             }
 
             foreach (var utocPath in utocFiles)
@@ -5159,6 +5357,7 @@ public partial class Program
                 int withBulk = 0;
                 int withOptionalBulk = 0;
                 int withoutBulk = 0;
+                var typeCounts = new Dictionary<string, int>();
 
                 foreach (var (packageId, chunks) in packageChunks.OrderBy(kvp => kvp.Key))
                 {
@@ -5169,6 +5368,14 @@ public partial class Program
                     if (path == null) path = $"<unknown:{packageId:X16}>";
 
                     if (filterPattern != null && !path.Contains(filterPattern, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    // Resolved before anything is counted or printed, so that filtering by type
+                    // leaves the summary describing what was actually listed.
+                    var exportChunk = chunks.First(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData);
+                    string? assetType = includeTypes ? ReadAssetType(reader, exportChunk, scriptObjects) : null;
+
+                    if (typeFilter.Count > 0 && !typeFilter.Contains(assetType ?? "unknown"))
                         continue;
 
                     totalPackages++;
@@ -5189,29 +5396,39 @@ public partial class Program
 
                     string bulkStatus = typeFlags.Count > 0 ? $" [{string.Join(", ", typeFlags)}]" : " [no bulk]";
 
-                    // Get sizes
-                    var exportChunk = chunks.First(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData);
-                    int exportSize = 0;
-                    try { exportSize = reader.ReadChunk(exportChunk).Length; } catch { }
+                    // Sizes come from the TOC. This used to decompress every chunk just to
+                    // measure it, which made listing a container cost about as much as
+                    // extracting it.
+                    long exportSize = Math.Max(0, reader.GetChunkSize(exportChunk));
 
-                    int bulkSize = 0;
+                    long bulkSize = 0;
                     if (hasBulk)
                     {
                         foreach (var bc in chunks.Where(c => c.GetChunkType() == IoStore.EIoChunkType.BulkData))
-                        {
-                            try { bulkSize += reader.ReadChunk(bc).Length; } catch { }
-                        }
+                            bulkSize += Math.Max(0, reader.GetChunkSize(bc));
                     }
 
                     string sizeInfo = hasBulk
                         ? $"export={exportSize:N0}b bulk={bulkSize:N0}b"
                         : $"export={exportSize:N0}b";
 
-                    Console.WriteLine($"  {path}{bulkStatus}  ({sizeInfo})");
+                    string typeInfo = string.Empty;
+                    if (includeTypes)
+                    {
+                        typeInfo = $"  <{assetType ?? "unknown"}>";
+                        typeCounts[assetType ?? "unknown"] = typeCounts.GetValueOrDefault(assetType ?? "unknown") + 1;
+                    }
+
+                    Console.WriteLine($"  {path}{bulkStatus}{typeInfo}  ({sizeInfo})");
                 }
 
                 Console.WriteLine();
                 Console.WriteLine($"  Summary: {totalPackages} packages, {withBulk} with .ubulk, {withOptionalBulk} with .uptnl, {withoutBulk} without bulk data");
+                if (includeTypes && typeCounts.Count > 0)
+                {
+                    var byCount = typeCounts.OrderByDescending(kvp => kvp.Value).ThenBy(kvp => kvp.Key);
+                    Console.WriteLine($"  Types:   {string.Join(", ", byCount.Select(kvp => $"{kvp.Key} x{kvp.Value}"))}");
+                }
                 Console.WriteLine();
 
                 reader.Dispose();
@@ -6034,37 +6251,102 @@ public partial class Program
     /// <summary>
     /// List all packages in an IoStore container
     /// </summary>
-    private static UAssetResponse ListIoStoreFiles(string? utocPath, string? aesKeyHex)
+    private static UAssetResponse ListIoStoreFiles(
+        string? utocPath, string? aesKeyHex, bool includeTypes = false,
+        string? scriptObjectsPath = null, string? gamePaks = null, List<string>? typeFilter = null)
     {
+        // Filtering by type only means anything once the types are known, so asking for one
+        // turns them on.
+        var wantedTypes = new HashSet<string>(typeFilter ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
+        if (wantedTypes.Count > 0) includeTypes = true;
+
         if (string.IsNullOrEmpty(utocPath))
             return new UAssetResponse { Success = false, Message = "UTOC path is required" };
-        
-        if (!File.Exists(utocPath))
-            return new UAssetResponse { Success = false, Message = $"UTOC file not found: {utocPath}" };
-        
+
+        // Accept either a single .utoc or a directory of them, matching the CLI.
+        var utocFiles = new List<string>();
+        if (Directory.Exists(utocPath))
+        {
+            utocFiles.AddRange(Directory.GetFiles(utocPath, "*.utoc", SearchOption.TopDirectoryOnly));
+            if (utocFiles.Count == 0)
+                return new UAssetResponse { Success = false, Message = $"No .utoc files in directory: {utocPath}" };
+            utocFiles.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+        else if (File.Exists(utocPath))
+        {
+            utocFiles.Add(utocPath);
+        }
+        else
+        {
+            return new UAssetResponse { Success = false, Message = $"UTOC file or directory not found: {utocPath}" };
+        }
+
         try
         {
             byte[]? aesKey = ParseAesKeyOrDefault(aesKeyHex);
-            using var reader = new IoStore.IoStoreReader(utocPath, aesKey);
-            
-            // Get all chunks and their paths, resolved to Marvel/Content/ format
-            var chunks = reader.GetChunks()
-                .Select((chunkId, idx) => new { Index = idx, ChunkType = chunkId.ChunkType.ToString(), Path = reader.GetChunkPath(chunkId) })
-                .Where(c => c.Path != null)
-                .ToList();
-            
-            var resolvedPaths = chunks.Select(c => ResolveGamePathToContent(c.Path!)).ToList();
-            
+
+            // Only loaded when types were asked for - it is the one part of this that costs
+            // real work, and every caller that just wants paths should not pay for it.
+            ZenPackage.ScriptObjectsDatabase? scriptObjects = includeTypes
+                ? LoadScriptObjectsForListing(scriptObjectsPath, gamePaks, utocPath, aesKeyHex)
+                : null;
+
+            var resolvedPaths = new List<string>();
+            var assetTypes = new List<string?>();
+            var containerNames = new List<string>();
+
+            foreach (var file in utocFiles)
+            {
+                using var reader = new IoStore.IoStoreReader(file, aesKey);
+                containerNames.Add(reader.ContainerName);
+
+                // Get all chunks and their paths, resolved to Marvel/Content/ format
+                var chunks = reader.GetChunks()
+                    .Select((chunkId, idx) => new { Index = idx, ChunkId = chunkId, Path = reader.GetChunkPath(chunkId) })
+                    .Where(c => c.Path != null)
+                    .ToList();
+
+                foreach (var chunk in chunks)
+                {
+                    // Types are kept in an array parallel to files so the existing shape of
+                    // files is untouched for callers that do not ask for them.
+                    if (!includeTypes)
+                    {
+                        resolvedPaths.Add(ResolveGamePathToContent(chunk.Path!));
+                        continue;
+                    }
+
+                    string? assetType = chunk.ChunkId.GetChunkType() == IoStore.EIoChunkType.ExportBundleData
+                        ? ReadAssetType(reader, chunk.ChunkId, scriptObjects)
+                        : null;
+
+                    if (wantedTypes.Count > 0 && !wantedTypes.Contains(assetType ?? "unknown"))
+                        continue;
+
+                    resolvedPaths.Add(ResolveGamePathToContent(chunk.Path!));
+                    assetTypes.Add(assetType);
+                }
+            }
+
+            var data = new Dictionary<string, object?>
+            {
+                ["package_count"] = resolvedPaths.Count,
+                ["container_name"] = containerNames.Count == 1 ? containerNames[0] : string.Join(", ", containerNames),
+                ["containers"] = containerNames,
+                ["files"] = resolvedPaths
+            };
+
+            if (includeTypes)
+            {
+                data["types"] = assetTypes;
+                data["script_objects_loaded"] = scriptObjects != null;
+            }
+
             return new UAssetResponse
             {
                 Success = true,
-                Message = $"Found {chunks.Count} packages in IoStore",
-                Data = new Dictionary<string, object?>
-                {
-                    ["package_count"] = chunks.Count,
-                    ["container_name"] = reader.ContainerName,
-                    ["files"] = resolvedPaths
-                }
+                Message = $"Found {resolvedPaths.Count} packages in {utocFiles.Count} container(s)",
+                Data = data
             };
         }
         catch (Exception ex)
@@ -7316,6 +7598,15 @@ public class UAssetRequest
     /// </summary>
     [JsonPropertyName("with_deps")]
     public bool WithDeps { get; set; } = false;
+
+    [JsonPropertyName("include_types")]
+    public bool IncludeTypes { get; set; } = false;
+
+    [JsonPropertyName("script_objects_path")]
+    public string? ScriptObjectsPath { get; set; }
+
+    [JsonPropertyName("type_filter")]
+    public List<string>? TypeFilter { get; set; }
 }
 
 public class UAssetResponse
