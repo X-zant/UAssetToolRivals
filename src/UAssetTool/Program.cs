@@ -5146,16 +5146,18 @@ public partial class Program
 
         try
         {
-            var header = ZenPackage.FZenPackageHeader.Deserialize(
+            // Only the export map is needed, and reading just that skips the name map, import
+            // map, bundle entries and dependency arcs that a full header parse walks.
+            var exportMap = ZenPackage.FZenPackageHeader.ReadExportMapOnly(
                 headerBytes, ZenPackage.EIoContainerHeaderVersion.NoExportInfo);
 
-            if (header.ExportMap == null || header.ExportMap.Count == 0) return null;
+            if (exportMap == null || exportMap.Count == 0) return null;
 
             // The asset is a top level export - one with no outer. Nested exports (components,
             // SCS nodes) all hang off it. Fall back to the first export for the rare package
             // that has no top level entry at all.
-            var topLevel = header.ExportMap.Where(e => e.OuterIndex.IsNull()).ToList();
-            if (topLevel.Count == 0) topLevel = header.ExportMap.Take(1).ToList();
+            var topLevel = exportMap.Where(e => e.OuterIndex.IsNull()).ToList();
+            if (topLevel.Count == 0) topLevel = exportMap.Take(1).ToList();
 
             // A package can have several top level exports, so one of them has to be picked as
             // the asset: a level sequence sits next to its director blueprint, and a blueprint
@@ -5182,9 +5184,9 @@ public partial class Program
                     if (!candidate.ClassIndex.IsExport()) continue;
 
                     uint classExport = candidate.ClassIndex.ToExportIndex();
-                    if (classExport < header.ExportMap.Count && header.ExportMap[(int)classExport].ClassIndex.IsScriptImport())
+                    if (classExport < exportMap.Count && exportMap[(int)classExport].ClassIndex.IsScriptImport())
                     {
-                        main = header.ExportMap[(int)classExport];
+                        main = exportMap[(int)classExport];
                         break;
                     }
                 }
@@ -5368,21 +5370,38 @@ public partial class Program
                 int withoutBulk = 0;
                 var typeCounts = new Dictionary<string, int>();
 
+                // Gather the packages to report first, in the order they will be printed.
+                var listed = new List<(ulong PackageId, List<IoStore.FIoChunkId> Chunks, string Path, IoStore.FIoChunkId ExportChunk)>();
                 foreach (var (packageId, chunks) in packageChunks.OrderBy(kvp => kvp.Key))
                 {
-                    bool hasExportBundle = chunks.Any(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData);
-                    if (!hasExportBundle) continue; // Skip non-package chunks (ContainerHeader, ScriptObjects, etc.)
+                    // Skip non-package chunks (ContainerHeader, ScriptObjects, etc.)
+                    if (!chunks.Any(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData)) continue;
 
-                    string? path = reader.GetChunkPath(chunks.First(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData));
-                    if (path == null) path = $"<unknown:{packageId:X16}>";
+                    var bundleChunk = chunks.First(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData);
+                    string path = reader.GetChunkPath(bundleChunk) ?? $"<unknown:{packageId:X16}>";
 
                     if (filterPattern != null && !path.Contains(filterPattern, StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    // Resolved before anything is counted or printed, so that filtering by type
-                    // leaves the summary describing what was actually listed.
-                    var exportChunk = chunks.First(c => c.GetChunkType() == IoStore.EIoChunkType.ExportBundleData);
-                    string? assetType = includeTypes ? ReadAssetType(reader, exportChunk, scriptObjects) : null;
+                    listed.Add((packageId, chunks, path, bundleChunk));
+                }
+
+                // Reading a type means decompressing the block that holds a package header, which
+                // is by far the most expensive part of a typed listing and is independent per
+                // package. Resolve them together, into a slot each, so the report below still
+                // prints in container order. Oodle guards its own initialisation against
+                // parallel callers and reads are positional, so the reader takes concurrency.
+                var assetTypes = new string?[listed.Count];
+                if (includeTypes)
+                {
+                    System.Threading.Tasks.Parallel.For(0, listed.Count,
+                        i => assetTypes[i] = ReadAssetType(reader, listed[i].ExportChunk, scriptObjects));
+                }
+
+                for (int listedIndex = 0; listedIndex < listed.Count; listedIndex++)
+                {
+                    var (packageId, chunks, path, exportChunk) = listed[listedIndex];
+                    string? assetType = assetTypes[listedIndex];
 
                     if (typeFilter.Count > 0 && !typeFilter.Contains(assetType ?? "unknown"))
                         continue;
@@ -6315,25 +6334,31 @@ public partial class Program
                     .Where(c => c.Path != null)
                     .ToList();
 
-                foreach (var chunk in chunks)
+                // Types are kept in an array parallel to files so the existing shape of files
+                // is untouched for callers that do not ask for them.
+                if (!includeTypes)
                 {
-                    // Types are kept in an array parallel to files so the existing shape of
-                    // files is untouched for callers that do not ask for them.
-                    if (!includeTypes)
-                    {
+                    foreach (var chunk in chunks)
                         resolvedPaths.Add(ResolveGamePathToContent(chunk.Path!));
+                    continue;
+                }
+
+                // Reading a type decompresses the block holding a package header, which is the
+                // expensive part and is independent per package. Resolve them together into a
+                // slot each, then collect in order so the output does not depend on timing.
+                var chunkTypes = new string?[chunks.Count];
+                System.Threading.Tasks.Parallel.For(0, chunks.Count, i =>
+                    chunkTypes[i] = chunks[i].ChunkId.GetChunkType() == IoStore.EIoChunkType.ExportBundleData
+                        ? ReadAssetType(reader, chunks[i].ChunkId, scriptObjects)
+                        : null);
+
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    if (wantedTypes.Count > 0 && !wantedTypes.Contains(chunkTypes[i] ?? "unknown"))
                         continue;
-                    }
 
-                    string? assetType = chunk.ChunkId.GetChunkType() == IoStore.EIoChunkType.ExportBundleData
-                        ? ReadAssetType(reader, chunk.ChunkId, scriptObjects)
-                        : null;
-
-                    if (wantedTypes.Count > 0 && !wantedTypes.Contains(assetType ?? "unknown"))
-                        continue;
-
-                    resolvedPaths.Add(ResolveGamePathToContent(chunk.Path!));
-                    assetTypes.Add(assetType);
+                    resolvedPaths.Add(ResolveGamePathToContent(chunks[i].Path!));
+                    assetTypes.Add(chunkTypes[i]);
                 }
             }
 

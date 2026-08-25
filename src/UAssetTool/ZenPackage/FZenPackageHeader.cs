@@ -130,6 +130,45 @@ public class FZenPackageHeader
         return baseName;
     }
 
+    /// <summary>
+    /// Read only the export map out of a package header.
+    ///
+    /// Deserialize also walks the name map, bulk data map, imported hashes, import map, bundle
+    /// entries, dependency arcs and imported package names. A caller that only needs the
+    /// exports - the asset type scan - pays a string allocation per name and several list
+    /// allocations for data it never looks at. Reading the summary and seeking straight to the
+    /// export map skips all of it.
+    ///
+    /// Returns null when the data does not reach the end of the export map, which tells the
+    /// caller it was handed too short a prefix.
+    /// </summary>
+    public static List<FExportMapEntry>? ReadExportMapOnly(byte[] data, EIoContainerHeaderVersion containerHeaderVersion)
+    {
+        using var ms = new MemoryStream(data);
+        using var reader = new BinaryReader(ms);
+
+        var summary = new FZenPackageSummary();
+        summary.Read(reader, containerHeaderVersion);
+
+        int start = summary.ExportMapOffset;
+        int end = summary.ExportBundleEntriesOffset;
+        if (start <= 0 || end <= start || end > data.Length) return null;
+
+        const int ExportEntrySize = 72;
+        int count = (end - start) / ExportEntrySize;
+        var exports = new List<FExportMapEntry>(count);
+
+        ms.Seek(start, SeekOrigin.Begin);
+        for (int i = 0; i < count; i++)
+        {
+            var entry = new FExportMapEntry();
+            entry.Read(reader);
+            exports.Add(entry);
+        }
+
+        return exports;
+    }
+
     public static FZenPackageHeader Deserialize(byte[] data, EIoContainerHeaderVersion containerHeaderVersion)
     {
         using var ms = new MemoryStream(data);
