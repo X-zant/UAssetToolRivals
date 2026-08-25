@@ -5293,6 +5293,15 @@ public partial class Program
                 gamePaks = args[++i];
         }
 
+        // Main sets Console.OutputEncoding so unicode paths print correctly, and that leaves
+        // Console.Out flushing on every write. A container listing is tens of thousands of
+        // lines, and at roughly a millisecond of syscall each that costs far more than reading
+        // the container does - 27s of a 27.3s run over pakchunkHQ. Buffer it instead.
+        // UTF8Encoding(false) rather than Console.OutputEncoding: the latter carries a
+        // preamble, and a StreamWriter built on it would open the listing with a BOM that
+        // Console.Out never emitted.
+        using var stdout = new StreamWriter(Console.OpenStandardOutput(), new System.Text.UTF8Encoding(false), 1 << 16) { AutoFlush = false };
+
         try
         {
             // Collect utoc files
@@ -5324,7 +5333,7 @@ public partial class Program
 
             foreach (var utocPath in utocFiles)
             {
-                Console.WriteLine($"=== {Path.GetFileName(utocPath)} ===");
+                stdout.WriteLine($"=== {Path.GetFileName(utocPath)} ===");
 
                 IoStore.IoStoreReader reader;
                 if (!string.IsNullOrEmpty(aesKey))
@@ -5419,17 +5428,17 @@ public partial class Program
                         typeCounts[assetType ?? "unknown"] = typeCounts.GetValueOrDefault(assetType ?? "unknown") + 1;
                     }
 
-                    Console.WriteLine($"  {path}{bulkStatus}{typeInfo}  ({sizeInfo})");
+                    stdout.WriteLine($"  {path}{bulkStatus}{typeInfo}  ({sizeInfo})");
                 }
 
-                Console.WriteLine();
-                Console.WriteLine($"  Summary: {totalPackages} packages, {withBulk} with .ubulk, {withOptionalBulk} with .uptnl, {withoutBulk} without bulk data");
+                stdout.WriteLine();
+                stdout.WriteLine($"  Summary: {totalPackages} packages, {withBulk} with .ubulk, {withOptionalBulk} with .uptnl, {withoutBulk} without bulk data");
                 if (includeTypes && typeCounts.Count > 0)
                 {
                     var byCount = typeCounts.OrderByDescending(kvp => kvp.Value).ThenBy(kvp => kvp.Key);
-                    Console.WriteLine($"  Types:   {string.Join(", ", byCount.Select(kvp => $"{kvp.Key} x{kvp.Value}"))}");
+                    stdout.WriteLine($"  Types:   {string.Join(", ", byCount.Select(kvp => $"{kvp.Key} x{kvp.Value}"))}");
                 }
-                Console.WriteLine();
+                stdout.WriteLine();
 
                 reader.Dispose();
             }
