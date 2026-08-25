@@ -279,17 +279,28 @@ public class IoStoreReader : IDisposable
 
         uint compressionBlockSize = _toc.CompressionBlockSize;
         int firstBlockIndex = (int)(offset / compressionBlockSize);
-        int lastBlockIndex = (int)((AlignU64(offset + size, compressionBlockSize) - 1) / compressionBlockSize);
+
+        // Only the blocks covering the requested bytes are needed. Bounding this by wanted
+        // rather than by the whole chunk is what keeps a prefix read cheap: reading a package
+        // header out of a multi-megabyte texture chunk otherwise allocated, and zeroed, a
+        // buffer the size of the texture.
+        int lastBlockIndex = (int)((AlignU64(offset + (ulong)wanted, compressionBlockSize) - 1) / compressionBlockSize);
 
         // Bounds check
         if (firstBlockIndex >= _toc.CompressionBlocks.Count || lastBlockIndex >= _toc.CompressionBlocks.Count)
         {
-            byte[] directData = new byte[size];
-            ReadAt((long)offset, directData, 0, (int)size);
+            byte[] directData = new byte[wanted];
+            ReadAt((long)offset, directData, 0, wanted);
             return directData;
         }
 
-        byte[] data2 = new byte[AlignUSize((int)size, 16)];
+        // Sized from the blocks actually decompressed, since each writes its own uncompressed
+        // length at its own offset and the last one must not run off the end.
+        long blockBytes = 0;
+        for (int b = firstBlockIndex; b <= lastBlockIndex; b++)
+            blockBytes += _toc.CompressionBlocks[b].UncompressedSize;
+
+        byte[] data2 = new byte[AlignUSize((int)Math.Max(blockBytes, wanted), 16)];
         int cur = 0;
 
         for (int blockIndex = firstBlockIndex; blockIndex <= lastBlockIndex; blockIndex++)
