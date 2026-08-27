@@ -22,6 +22,7 @@ public class FZenPackageContext : IDisposable
     /// Used to keep a mod's bulk payload lookups from matching the game package it overrides.
     private readonly HashSet<int> _priorityContainers = new();
     private readonly Dictionary<ulong, string> _packageIdToPath = new(); // PackageId -> full package path
+    private readonly Dictionary<ulong, string> _packageIdToContainerPath = new(); // PackageId -> path inside the container
     private readonly Dictionary<ulong, List<ulong>> _packageExportHashes = new(); // PackageId -> list of public export hashes
     private readonly Dictionary<int, List<string>> _containerNameMaps = new(); // ContainerIndex -> global name map
     // Per-package export hash lookup: packageId -> (cityHash64(lowerName) -> exportIndex)
@@ -185,9 +186,15 @@ public class FZenPackageContext : IDisposable
                 string? chunkPath = reader.GetChunkPath(chunk);
                 if (!string.IsNullOrEmpty(chunkPath))
                 {
-                    // Convert file path to package path (remove extension, convert to /Game/... format)
+                    // Convert file path to package path (remove extension, mount aware)
                     string packagePath = ConvertFilePathToPackagePath(chunkPath);
                     _packageIdToPath[packageId] = packagePath;
+
+                    // Keep the container path too. It is the only place the mount is spelled
+                    // out in full - a package path names the plugin but not where the plugin
+                    // lives, so /Niagara/X cannot be turned back into
+                    // Engine/Plugins/FX/Niagara/Content/X without it.
+                    _packageIdToContainerPath[packageId] = StripMountPrefix(chunkPath);
                 }
             }
         }
@@ -322,9 +329,35 @@ public class FZenPackageContext : IDisposable
         while (path.StartsWith("../"))
             path = path[3..];
         
-        // Handle common UE content paths
-        // Marvel/Content/... -> /Game/...
-        // The content after "/Content/" is the actual package path
+        // Map the cooked location back onto the mount it came from. Rewriting every
+        // "/Content/" to /Game/ collapsed three different mounts into one: an engine asset
+        // became /Game/EngineMaterials/..., and a plugin asset became /Game/Marvel/... where
+        // it could collide with a real /Game/ package. These names are handed out as import
+        // names, and a package id is the hash of the name, so getting this wrong points an
+        // import at a package that either does not exist or is the wrong one.
+
+        // A plugin mounts at its own name: <root>/Plugins/[category/]<Name>/Content/X -> /<Name>/X.
+        // The category folders are part of the layout on disk only, which is why this cannot
+        // be run in reverse - see GetContainerPath.
+        int pluginsIdx = path.IndexOf("/Plugins/", StringComparison.OrdinalIgnoreCase);
+        if (pluginsIdx >= 0)
+        {
+            int pluginContentIdx = path.IndexOf("/Content/", pluginsIdx, StringComparison.OrdinalIgnoreCase);
+            if (pluginContentIdx > pluginsIdx)
+            {
+                string between = path[(pluginsIdx + 9)..pluginContentIdx];
+                int lastSlash = between.LastIndexOf('/');
+                string pluginName = lastSlash >= 0 ? between[(lastSlash + 1)..] : between;
+                if (pluginName.Length > 0)
+                    return "/" + pluginName + path[(pluginContentIdx + 8)..];
+            }
+        }
+
+        // Engine content mounts at /Engine.
+        if (path.StartsWith("Engine/Content/", StringComparison.OrdinalIgnoreCase))
+            return "/Engine/" + path["Engine/Content/".Length..];
+
+        // Anything else under a Content folder is project content, which mounts at /Game.
         if (path.Contains("/Content/"))
         {
             int contentIdx = path.IndexOf("/Content/");
@@ -335,7 +368,7 @@ public class FZenPackageContext : IDisposable
         {
             path = "/Game/" + path;
         }
-        
+
         return path;
     }
 
@@ -441,6 +474,26 @@ public class FZenPackageContext : IDisposable
         return _packageIdToChunk.ContainsKey(packageId);
     }
     
+    /// <summary>
+    /// Path of a package inside its container, mount prefix removed - for example
+    /// Marvel/Plugins/MarvelGAS/Content/Marvel/AbilitySystem/1053/1053_Table/x.uasset.
+    /// This is what the cooker laid down, so extracting to it round-trips exactly.
+    /// </summary>
+    public string? GetContainerPath(ulong packageId)
+    {
+        return _packageIdToContainerPath.TryGetValue(packageId, out string? path) ? path : null;
+    }
+
+    /// <summary>
+    /// Drop the leading ../ segments a container mount point starts with.
+    /// </summary>
+    private static string StripMountPrefix(string path)
+    {
+        string p = path;
+        while (p.StartsWith("../")) p = p[3..];
+        return p.TrimStart('/');
+    }
+
     /// <summary>
     /// Get the full package path for a package ID
     /// </summary>
@@ -686,15 +739,11 @@ public class FZenPackageContext : IDisposable
             return null;
         }
         
-        // Step 2: Get the relative path (without mount point) and change extension
-        // chunkPath = mountPoint + "/" + relativePath (e.g. "../../../Marvel/Content/Marvel/.../T_Foo.uasset")
-        // We need the relativePath part to match against other containers' FileMap
-        string mountPoint = sourceReader.Toc.MountPoint.TrimEnd('/');
-        string relativePath;
-        if (chunkPath.StartsWith(mountPoint + "/"))
-            relativePath = chunkPath.Substring(mountPoint.Length + 1);
-        else
-            relativePath = chunkPath;
+        // Step 2: Change the extension. GetChunkPath returns the directory index key, mount
+        // point included, and that is exactly how every container's FileMap is keyed - so it is
+        // used as-is. This used to strip a mount prefix here, which was only correct because
+        // GetChunkPath applied the mount a second time; both sides are fixed together.
+        string relativePath = chunkPath;
         
         // Change extension: .uasset -> .uptnl or .m.ubulk
         string bulkRelPath;

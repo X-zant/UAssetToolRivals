@@ -397,9 +397,13 @@ public class IoStoreReader : IDisposable
         if (!_toc.FileMapRev.TryGetValue(tocEntryIndex, out string? path))
             return null;
 
-        // Combine with mount point, using forward slashes for consistency
-        string fullPath = _toc.MountPoint.TrimEnd('/') + "/" + path;
-        return fullPath;
+        // Directory index paths are built starting from the mount point (see BuildFilePaths),
+        // so what is stored here already carries it and must not have it applied again. Doing
+        // so repeated the mount: harmless-looking on a shallow "../../../" container, but one
+        // mounted deeper came out as
+        //   ../../../Marvel/Content/Marvel/Environment/../../../Marvel/Content/Marvel/...
+        // which resolves to Marvel/Marvel/Content/... rather than the real path.
+        return path;
     }
 
     /// <summary>

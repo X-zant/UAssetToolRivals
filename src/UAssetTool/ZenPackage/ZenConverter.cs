@@ -80,19 +80,20 @@ public class ZenConverter
         string uassetPath,
         EIoContainerHeaderVersion containerVersion = EIoContainerHeaderVersion.NoExportInfo)
     {
-        var zenData = ConvertLegacyToZenInternal(uassetPath, containerVersion, out string packagePath, out _);
+        var zenData = ConvertLegacyToZenInternal(uassetPath, containerVersion, out string packagePath, out _, out _);
         return (zenData, packagePath);
     }
     
     /// <summary>
     /// Convert Legacy package to Zen format and return the package path and FZenPackage object
     /// </summary>
-    public static (byte[] ZenData, string PackagePath, FZenPackage ZenPackage) ConvertLegacyToZenFull(
+    public static (byte[] ZenData, string PackagePath, string GamePath, FZenPackage ZenPackage) ConvertLegacyToZenFull(
         string uassetPath,
-        EIoContainerHeaderVersion containerVersion = EIoContainerHeaderVersion.NoExportInfo)
+        EIoContainerHeaderVersion containerVersion = EIoContainerHeaderVersion.NoExportInfo,
+        string? inputRoot = null)
     {
-        var zenData = ConvertLegacyToZenInternal(uassetPath, containerVersion, out string packagePath, out FZenPackage zenPackage);
-        return (zenData, packagePath, zenPackage);
+        var zenData = ConvertLegacyToZenInternal(uassetPath, containerVersion, out string packagePath, out FZenPackage zenPackage, out string gamePath, inputRoot);
+        return (zenData, packagePath, gamePath, zenPackage);
     }
     
     /// <summary>
@@ -102,14 +103,16 @@ public class ZenConverter
         string uassetPath,
         EIoContainerHeaderVersion containerVersion = EIoContainerHeaderVersion.NoExportInfo)
     {
-        return ConvertLegacyToZenInternal(uassetPath, containerVersion, out _, out _);
+        return ConvertLegacyToZenInternal(uassetPath, containerVersion, out _, out _, out _);
     }
 
     private static byte[] ConvertLegacyToZenInternal(
         string uassetPath,
         EIoContainerHeaderVersion containerVersion,
         out string packagePath,
-        out FZenPackage zenPackageOut)
+        out FZenPackage zenPackageOut,
+        out string gamePathOut,
+        string? inputRoot = null)
     {
         // Try to load script objects database if not already loaded
         lock (_scriptObjectsLock)
@@ -164,6 +167,8 @@ public class ZenConverter
             gamePath = gamePath.TrimEnd('/') + "/" + assetName;
         }
         
+        gamePathOut = gamePath;
+
         // Convert /Game/X to Marvel/Content/X for packagePath (used in UTOC directory index)
         if (gamePath.StartsWith("/Game/"))
         {
@@ -172,6 +177,26 @@ public class ZenConverter
         else
         {
             packagePath = gamePath.TrimStart('/');
+        }
+
+        // A package path names the mount but not where the mount lives, so it cannot say that
+        // /MarvelGAS/X belongs at Marvel/Plugins/MarvelGAS/Content/X. When the caller knows the
+        // root the assets were laid out under, the location on disk answers that directly -
+        // extraction mirrors the container, so the relative path is the directory index entry.
+        if (!string.IsNullOrEmpty(inputRoot))
+        {
+            string fullAssetPath = Path.GetFullPath(uassetPath);
+            string fullRoot = Path.GetFullPath(inputRoot);
+            if (fullAssetPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                string relative = fullAssetPath.Substring(fullRoot.Length)
+                    .Replace(Path.DirectorySeparatorChar, '/')
+                    .TrimStart('/');
+                if (relative.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
+                    relative = relative[..^7];
+                if (relative.Length > 0)
+                    packagePath = relative;
+            }
         }
         
         string uexpPath = Path.ChangeExtension(uassetPath, ".uexp");

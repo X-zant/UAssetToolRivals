@@ -102,6 +102,42 @@ public partial class Program
         }
     }
     
+    /// <summary>
+    /// Report the build over the JSON API. Repak-X loads this as a library rather than running
+    /// the executable, so the CLI's version command is not reachable from there.
+    /// </summary>
+    private static UAssetResponse GetVersionJson()
+    {
+        var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+        string? informational = assembly
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+
+        // The informational version carries the commit as "1.7.0+<sha>" when the build was
+        // stamped with one. Split it so callers do not have to.
+        string version = informational ?? assembly.GetName().Version?.ToString() ?? "unknown";
+        string? commit = null;
+        int plus = version.IndexOf('+');
+        if (plus >= 0)
+        {
+            commit = version[(plus + 1)..];
+            version = version[..plus];
+        }
+
+        return new UAssetResponse
+        {
+            Success = true,
+            Message = $"UAssetTool v{version}",
+            Data = new Dictionary<string, object?>
+            {
+                ["name"] = "UAssetTool",
+                ["version"] = version,
+                ["commit"] = commit,
+                ["informational_version"] = informational,
+                ["assembly_version"] = assembly.GetName().Version?.ToString()
+            }
+        };
+    }
+
     private static int CliVersion()
     {
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
@@ -615,6 +651,22 @@ public partial class Program
         }
     }
 
+    /// <summary>
+    /// Longest input root that contains this file, or null when it came from none of them.
+    /// The relative path under that root is the entry the container directory index gets, so
+    /// assets extracted to a plugin or engine location repack to where they came from.
+    /// </summary>
+    private static string? FindInputRoot(List<string> roots, string filePath)
+    {
+        string? best = null;
+        foreach (var root in roots)
+        {
+            if (!filePath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+            if (best == null || root.Length > best.Length) best = root;
+        }
+        return best;
+    }
+
     private static int CliCreateModIoStore(string[] args)
     {
         if (args.Length < 3)
@@ -650,6 +702,7 @@ public partial class Program
         // (inputs are processed inline as the arg loop encounters them).
         bool hybrid = args.Any(a => a.Equals("--hybrid", StringComparison.OrdinalIgnoreCase));
         var uassetFiles = new List<string>();
+        var inputRoots = new List<string>();
         var shaderBytecodeFiles = new List<string>();
         // Hybrid raw files: (in-PAK relative path, absolute path on disk).
         var rawFiles = new List<(string inPakPath, string absPath)>();
@@ -722,6 +775,7 @@ public partial class Program
                     Console.Error.WriteLine($"[CreateModIoStore]   Extracted {extracted} files from PAK");
 
                     // Find all .uasset files in the extracted directory
+                    inputRoots.Add(Path.GetFullPath(tempDir));
                     var dirFiles = Directory.GetFiles(tempDir, "*.uasset", SearchOption.AllDirectories);
                     foreach (var f in dirFiles)
                     {
@@ -765,6 +819,7 @@ public partial class Program
             else if (Directory.Exists(args[i]))
             {
                 // Support directory input - recursively find all .uasset files
+                inputRoots.Add(Path.GetFullPath(args[i]));
                 var dirFiles = Directory.GetFiles(args[i], "*.uasset", SearchOption.AllDirectories);
                 foreach (var f in dirFiles)
                 {
@@ -838,7 +893,7 @@ public partial class Program
             int threadCount = Math.Max(1, (Environment.ProcessorCount * 3) / 4); // 75% of cores
             Console.Error.WriteLine($"[CreateModIoStore]   Threads: {threadCount}");
 
-            var conversionResults = new System.Collections.Concurrent.ConcurrentBag<(string assetName, string uassetPath, byte[]? zenData, string packagePath, ZenPackage.FZenPackage? zenPackage, byte[]? ubulkData, byte[]? uptnlData, byte[]? mubulkData, string? error)>();
+            var conversionResults = new System.Collections.Concurrent.ConcurrentBag<(string assetName, string uassetPath, byte[]? zenData, string packagePath, string gamePath, ZenPackage.FZenPackage? zenPackage, byte[]? ubulkData, byte[]? uptnlData, byte[]? mubulkData, string? error)>();
             int processedCount = 0;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -847,8 +902,9 @@ public partial class Program
                 string assetName = Path.GetFileNameWithoutExtension(uassetPath);
                 try
                 {
-                    var (zenData, packagePath, zenPackage) = ZenPackage.ZenConverter.ConvertLegacyToZenFull(
-                        uassetPath, containerVersion: ZenPackage.EIoContainerHeaderVersion.NoExportInfo);
+                    var (zenData, packagePath, gamePath, zenPackage) = ZenPackage.ZenConverter.ConvertLegacyToZenFull(
+                        uassetPath, containerVersion: ZenPackage.EIoContainerHeaderVersion.NoExportInfo,
+                        inputRoot: FindInputRoot(inputRoots, uassetPath));
 
                     byte[]? ubulkData = null;
                     string ubulkPath = Path.ChangeExtension(uassetPath, ".ubulk");
@@ -862,7 +918,7 @@ public partial class Program
                     string mubulkPath = Path.ChangeExtension(uassetPath, ".m.ubulk");
                     if (File.Exists(mubulkPath)) mubulkData = File.ReadAllBytes(mubulkPath);
 
-                    conversionResults.Add((assetName, uassetPath, zenData, packagePath, zenPackage, ubulkData, uptnlData, mubulkData, null));
+                    conversionResults.Add((assetName, uassetPath, zenData, packagePath, gamePath, zenPackage, ubulkData, uptnlData, mubulkData, null));
 
                     int count = Interlocked.Increment(ref processedCount);
                     if (count % 50 == 0 || count == uassetFiles.Count)
@@ -872,7 +928,7 @@ public partial class Program
                 }
                 catch (Exception ex)
                 {
-                    conversionResults.Add((assetName, uassetPath, null, "", null, null, null, null, ex.Message));
+                    conversionResults.Add((assetName, uassetPath, null, "", "", null, null, null, null, ex.Message));
                     Interlocked.Increment(ref processedCount);
                 }
             });
@@ -907,18 +963,13 @@ public partial class Program
 
                 try
                 {
-                    var (assetName, uassetPath, zenData, packagePath, zenPackage, ubulkData, uptnlData, mubulkData, _) = result;
+                    var (assetName, uassetPath, zenData, packagePath, gamePath, zenPackage, ubulkData, uptnlData, mubulkData, _) = result;
 
-                    // Create package ID using the /Game/... format
-                    string gamePackagePath;
-                    if (packagePath.StartsWith("Marvel/Content/"))
-                    {
-                        gamePackagePath = "/Game/" + packagePath.Substring("Marvel/Content/".Length);
-                    }
-                    else
-                    {
-                        gamePackagePath = "/" + packagePath;
-                    }
+                    // The package id is the hash of the package name, so it has to be the real
+                    // one. This used to be recovered from the directory index path by assuming a
+                    // Marvel/Content prefix, which only held for /Game/ content; the converter
+                    // resolves the actual name, so use that.
+                    string gamePackagePath = gamePath;
 
                     var packageId = IoStore.FPackageId.FromName(gamePackagePath);
                     var chunkId = IoStore.FIoChunkId.FromPackageId(packageId, 0, IoStore.EIoChunkType.ExportBundleData);
@@ -1699,7 +1750,16 @@ public partial class Program
                         imports.AddRange(converter.GetImportedPackageIds());
                     }
 
-                    string relPath = ResolveOutputPath(packageName);
+                    // Prefer the path the package actually occupies in the container. Deriving
+                    // a location from the package name instead cannot place anything outside
+                    // Marvel/Content: it has no way to know that /MarvelGAS/ lives under
+                    // Marvel/Plugins/MarvelGAS/Content, or /Niagara/ under
+                    // Engine/Plugins/FX/Niagara/Content, so those collapsed into the main
+                    // content tree and 67 plugin packages landed on top of real ones.
+                    string? containerPath = context.GetContainerPath(packageId);
+                    string relPath = !string.IsNullOrEmpty(containerPath)
+                        ? containerPath.Replace('/', Path.DirectorySeparatorChar)
+                        : ResolveOutputPath(packageName);
                     string outputAssetPath = Path.Combine(outputDir, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
@@ -2729,6 +2789,7 @@ public partial class Program
                 // IoStore operations
                 "list_iostore_files" => ListIoStoreFiles(request.FilePath, request.AesKey, request.IncludeTypes, request.ScriptObjectsPath, request.GamePaks, request.TypeFilter),
                 "create_iostore" => CreateIoStoreJson(request.OutputPath, request.InputDir, request.Compress, request.AesKey),
+                "version" => GetVersionJson(),
                 "is_iostore_compressed" => IsIoStoreCompressed(request.FilePath),
                 "is_iostore_encrypted" => IsIoStoreEncrypted(request.FilePath),
                 "recompress_iostore" => RecompressIoStore(request.FilePath),
@@ -7097,6 +7158,7 @@ public partial class Program
         {
             // Collect all uasset files
             var uassetFiles = Directory.GetFiles(effectiveInputDir, "*.uasset", SearchOption.AllDirectories).ToList();
+            var inputRoots = new List<string> { Path.GetFullPath(effectiveInputDir) };
 
             // Collect shader bytecode files
             var shaderFiles = Directory.GetFiles(effectiveInputDir, "*.ushaderbytecode", SearchOption.AllDirectories).ToList();
@@ -7140,7 +7202,7 @@ public partial class Program
             Console.Error.Flush();
             
             // Phase 1: Parallel conversion to Zen format (CPU-intensive)
-            var conversionResults = new System.Collections.Concurrent.ConcurrentBag<(string assetName, string uassetPath, byte[]? zenData, string packagePath, ZenPackage.FZenPackage? zenPackage, byte[]? ubulkData, byte[]? uptnlData, byte[]? mubulkData, string? error)>();
+            var conversionResults = new System.Collections.Concurrent.ConcurrentBag<(string assetName, string uassetPath, byte[]? zenData, string packagePath, string gamePath, ZenPackage.FZenPackage? zenPackage, byte[]? ubulkData, byte[]? uptnlData, byte[]? mubulkData, string? error)>();
             int processedCount = 0;
             
             Parallel.ForEach(uassetFiles, new ParallelOptions { MaxDegreeOfParallelism = threadCount }, uassetPath =>
@@ -7148,8 +7210,9 @@ public partial class Program
                 string assetName = Path.GetFileNameWithoutExtension(uassetPath);
                 try
                 {
-                    var (zenData, packagePath, zenPackage) = ZenPackage.ZenConverter.ConvertLegacyToZenFull(
-                        uassetPath, containerVersion: ZenPackage.EIoContainerHeaderVersion.NoExportInfo);
+                    var (zenData, packagePath, gamePath, zenPackage) = ZenPackage.ZenConverter.ConvertLegacyToZenFull(
+                        uassetPath, containerVersion: ZenPackage.EIoContainerHeaderVersion.NoExportInfo,
+                        inputRoot: FindInputRoot(inputRoots, uassetPath));
                     
                     byte[]? ubulkData = null;
                     string ubulkPath = Path.ChangeExtension(uassetPath, ".ubulk");
@@ -7163,7 +7226,7 @@ public partial class Program
                     string mubulkPath = Path.ChangeExtension(uassetPath, ".m.ubulk");
                     if (File.Exists(mubulkPath)) mubulkData = File.ReadAllBytes(mubulkPath);
                     
-                    conversionResults.Add((assetName, uassetPath, zenData, packagePath, zenPackage, ubulkData, uptnlData, mubulkData, null));
+                    conversionResults.Add((assetName, uassetPath, zenData, packagePath, gamePath, zenPackage, ubulkData, uptnlData, mubulkData, null));
                     
                     int count = Interlocked.Increment(ref processedCount);
                     if (count % 50 == 0 || count == uassetFiles.Count)
@@ -7174,7 +7237,7 @@ public partial class Program
                 }
                 catch (Exception ex)
                 {
-                    conversionResults.Add((assetName, uassetPath, null, "", null, null, null, null, ex.Message));
+                    conversionResults.Add((assetName, uassetPath, null, "", "", null, null, null, null, ex.Message));
                     Interlocked.Increment(ref processedCount);
                 }
             });
@@ -7208,18 +7271,13 @@ public partial class Program
                 
                 try
                 {
-                    var (assetName, uassetPath, zenData, packagePath, zenPackage, ubulkData, uptnlData, mubulkData, _) = result;
+                    var (assetName, uassetPath, zenData, packagePath, gamePath, zenPackage, ubulkData, uptnlData, mubulkData, _) = result;
                     
-                    // Create package ID using the /Game/... format
-                    string gamePackagePath;
-                    if (packagePath.StartsWith("Marvel/Content/"))
-                    {
-                        gamePackagePath = "/Game/" + packagePath.Substring("Marvel/Content/".Length);
-                    }
-                    else
-                    {
-                        gamePackagePath = "/" + packagePath;
-                    }
+                    // The package id is the hash of the package name, so it has to be the real
+                    // one. This used to be recovered from the directory index path by assuming a
+                    // Marvel/Content prefix, which only held for /Game/ content; the converter
+                    // resolves the actual name, so use that.
+                    string gamePackagePath = gamePath;
                     
                     var packageId = IoStore.FPackageId.FromName(gamePackagePath);
                     var chunkId = IoStore.FIoChunkId.FromPackageId(packageId, 0, IoStore.EIoChunkType.ExportBundleData);
