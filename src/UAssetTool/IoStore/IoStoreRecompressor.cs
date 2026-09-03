@@ -20,6 +20,23 @@ public static class IoStoreRecompressor
     /// <param name="aesKeyHex">AES key in hex format (optional, defaults to Marvel Rivals key)</param>
     /// <returns>Path to the recompressed .utoc file</returns>
     public static string Recompress(string utocPath, string? aesKeyHex = null)
+        => Rewrite(utocPath, aesKeyHex, enableCompression: true, enableEncryption: false);
+
+    /// <summary>
+    /// Rewrite an IoStore container, optionally turning on Oodle compression and/or AES
+    /// encryption of every chunk block plus the directory index.
+    ///
+    /// Encryption is not a header bit: the chunk payloads themselves are encrypted, so an
+    /// existing container has to be read out and written back to change it. Container id,
+    /// compression block size, encryption key GUID and the raw directory index tree are all
+    /// preserved, and the original container header chunk is passed through untouched.
+    /// </summary>
+    /// <param name="utocPath">Path to the .utoc file (rewritten in place)</param>
+    /// <param name="aesKeyHex">AES key in hex format (optional, defaults to Marvel Rivals key)</param>
+    /// <param name="enableCompression">Write chunks with Oodle compression</param>
+    /// <param name="enableEncryption">AES-encrypt chunk blocks and set the Encrypted container flag</param>
+    /// <returns>Path to the rewritten .utoc file</returns>
+    public static string Rewrite(string utocPath, string? aesKeyHex, bool enableCompression, bool enableEncryption)
     {
         aesKeyHex ??= DEFAULT_AES_KEY_HEX;
         byte[] aesKey = ParseAesKey(aesKeyHex);
@@ -32,7 +49,8 @@ public static class IoStoreRecompressor
         string tempUtocPath = Path.Combine(tempDir, Path.GetFileName(utocPath));
         string tempUcasPath = Path.Combine(tempDir, Path.GetFileName(ucasPath));
 
-        Console.Error.WriteLine($"[IoStoreRecompressor] Recompressing: {Path.GetFileName(utocPath)}");
+        Console.Error.WriteLine($"[IoStoreRecompressor] Rewriting: {Path.GetFileName(utocPath)} " +
+                                $"(compression={enableCompression}, encryption={enableEncryption})");
 
         // Read all chunks into memory, preserving original TOC metadata
         var chunks = new List<(FIoChunkId ChunkId, string? Path, byte[] Data)>();
@@ -97,8 +115,8 @@ public static class IoStoreRecompressor
             tocVersion,
             null, // Don't generate new container header - we pass through the original
             mountPoint,
-            enableCompression: true,
-            enableEncryption: false,
+            enableCompression: enableCompression,
+            enableEncryption: enableEncryption,
             aesKeyHex: aesKeyHex,
             containerId: originalContainerId,
             compressionBlockSize: originalCompressionBlockSize))

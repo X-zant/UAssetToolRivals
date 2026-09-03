@@ -6,9 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
+    <SelfContained>false</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
     <RuntimeIdentifiers>win-x64;linux-x64;osx-x64</RuntimeIdentifiers>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
@@ -16,7 +15,7 @@
     <RootNamespace>UAssetTool</RootNamespace>
     <Authors>Xzant</Authors>
     <RepositoryUrl>https://github.com/XzantGaming/UassetToolRivals</RepositoryUrl>
-    <Version>1.0.0</Version>
+    <Version>1.5.8</Version>
   </PropertyGroup>
 
   <ItemGroup>

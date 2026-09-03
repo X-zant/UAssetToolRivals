@@ -23,6 +23,10 @@ public class FZenPackageContext : IDisposable
     private readonly HashSet<int> _priorityContainers = new();
     private readonly Dictionary<ulong, string> _packageIdToPath = new(); // PackageId -> full package path
     private readonly Dictionary<ulong, string> _packageIdToContainerPath = new(); // PackageId -> path inside the container
+    // Normalized VFS path (no extension) -> PackageId, for exact CUE4Parse-style lookups
+    private readonly Dictionary<string, ulong> _vfsPathToPackageId = new(StringComparer.OrdinalIgnoreCase);
+    // Mount ("/Game/", "/MarvelGAS/") -> cooked root ("Marvel/Content", "Marvel/Plugins/MarvelGAS/Content")
+    private readonly Dictionary<string, string> _mountToVfsRoot = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ulong, List<ulong>> _packageExportHashes = new(); // PackageId -> list of public export hashes
     private readonly Dictionary<int, List<string>> _containerNameMaps = new(); // ContainerIndex -> global name map
     // Per-package export hash lookup: packageId -> (cityHash64(lowerName) -> exportIndex)
@@ -194,7 +198,10 @@ public class FZenPackageContext : IDisposable
                     // out in full - a package path names the plugin but not where the plugin
                     // lives, so /Niagara/X cannot be turned back into
                     // Engine/Plugins/FX/Niagara/Content/X without it.
-                    _packageIdToContainerPath[packageId] = StripMountPrefix(chunkPath);
+                    string vfsPath = StripMountPrefix(chunkPath);
+                    _packageIdToContainerPath[packageId] = vfsPath;
+                    _vfsPathToPackageId[StripPackageExtension(vfsPath)] = packageId;
+                    RecordMountRoot(packagePath, vfsPath);
                 }
             }
         }
@@ -322,12 +329,8 @@ public class FZenPackageContext : IDisposable
         else if (path.EndsWith(".ubulk", StringComparison.OrdinalIgnoreCase))
             path = path[..^6];
         
-        // Normalize path separators
-        path = path.Replace('\\', '/');
-        
-        // Remove mount point prefix (e.g., "../../../")
-        while (path.StartsWith("../"))
-            path = path[3..];
+        // Remove mount point prefix (e.g., "../../../"), including a repeated one
+        path = VfsPath.StripMountPrefix(path);
         
         // Map the cooked location back onto the mount it came from. Rewriting every
         // "/Content/" to /Game/ collapsed three different mounts into one: an engine asset
@@ -366,7 +369,8 @@ public class FZenPackageContext : IDisposable
         }
         else if (!path.StartsWith("/"))
         {
-            path = "/Game/" + path;
+            // No Content folder means the container indexes by mount, as mod containers do.
+            path = path.Contains('/') ? "/" + path : "/Game/" + path;
         }
 
         return path;
@@ -485,13 +489,101 @@ public class FZenPackageContext : IDisposable
     }
 
     /// <summary>
-    /// Drop the leading ../ segments a container mount point starts with.
+    /// Drop the ../ segments a container mount point starts with.
     /// </summary>
     private static string StripMountPrefix(string path)
     {
-        string p = path;
-        while (p.StartsWith("../")) p = p[3..];
-        return p.TrimStart('/');
+        return VfsPath.StripMountPrefix(path);
+    }
+
+    /// <summary>
+    /// Drop a package file extension, if present.
+    /// </summary>
+    private static string StripPackageExtension(string path)
+    {
+        foreach (var ext in new[] { ".uasset", ".umap", ".uexp", ".ubulk", ".uptnl" })
+        {
+            if (path.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+                return path[..^ext.Length];
+        }
+        return path;
+    }
+
+    /// <summary>
+    /// Normalize to the VFS index key form: forward slashes, no leading ../ or /, no extension.
+    /// </summary>
+    public static string NormalizeVfsPath(string path)
+    {
+        return StripPackageExtension(StripMountPrefix(path.Replace('\\', '/'))).TrimEnd('/');
+    }
+
+    /// <summary>
+    /// Learn a mount's cooked root by lining up a package's mount path against its VFS path.
+    /// </summary>
+    private void RecordMountRoot(string packagePath, string vfsPath)
+    {
+        if (!packagePath.StartsWith('/')) return;
+
+        int secondSlash = packagePath.IndexOf('/', 1);
+        if (secondSlash < 0) return;
+
+        string mount = packagePath[..(secondSlash + 1)];
+        if (_mountToVfsRoot.ContainsKey(mount)) return;
+
+        string tail = packagePath[secondSlash..];
+        string bare = StripPackageExtension(vfsPath);
+        // Only a pair that actually lines up teaches anything.
+        if (!bare.EndsWith(tail, StringComparison.OrdinalIgnoreCase)) return;
+
+        // A cooked mount always ends at a Content folder.
+        string root = bare[..^tail.Length];
+        if (!root.EndsWith("Content", StringComparison.OrdinalIgnoreCase)) return;
+
+        _mountToVfsRoot[mount] = root;
+    }
+
+    /// <summary>
+    /// Map a mount path (/Game/X, /MarvelGAS/X) to its VFS path; null if the mount is unknown.
+    /// </summary>
+    public string? ResolveMountToVfsPath(string packagePath)
+    {
+        if (string.IsNullOrEmpty(packagePath) || !packagePath.StartsWith('/'))
+            return null;
+
+        int secondSlash = packagePath.IndexOf('/', 1);
+        if (secondSlash < 0) return null;
+
+        string mount = packagePath[..(secondSlash + 1)];
+        if (!_mountToVfsRoot.TryGetValue(mount, out string? root))
+            return null;
+
+        return root + packagePath[secondSlash..];
+    }
+
+    /// <summary>
+    /// Exact lookup by VFS path, with or without the extension and in either slash style.
+    /// </summary>
+    public ulong? FindPackageIdByVfsPath(string vfsPath)
+    {
+        if (string.IsNullOrEmpty(vfsPath)) return null;
+        return _vfsPathToPackageId.TryGetValue(NormalizeVfsPath(vfsPath), out ulong id) ? id : null;
+    }
+
+    /// <summary>
+    /// Substring filter tested against both the VFS path and the mount path.
+    /// </summary>
+    public bool PathMatchesFilter(ulong packageId, string pattern)
+    {
+        string needle = NormalizeVfsPath(pattern);
+        if (needle.Length == 0) return false;
+
+        if (_packageIdToContainerPath.TryGetValue(packageId, out string? vfs) &&
+            vfs.Contains(needle, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return _packageIdToPath.TryGetValue(packageId, out string? pkg) &&
+               (pkg.Contains(pattern.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
+                pkg.Contains(needle, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>

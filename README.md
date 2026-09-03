@@ -164,7 +164,16 @@ UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter SK_1014 S
 
 # Extract with dependencies
 UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter Characters/1057 --with-deps
+
+# Filter by VFS path, including content outside Marvel/Content
+UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter Marvel/Plugins/MarvelGAS/Content/Marvel/AbilitySystem/1053
+UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter Engine/Plugins/FX/Niagara/Content
 ```
+
+**Filter paths:** patterns match the VFS path as CUE4Parse spells it - `Marvel/Content/...`,
+`Marvel/Plugins/<Plugin>/Content/...`, `Engine/Content/...` - as well as the mount path
+(`/Game/...`, `/Engine/...`) and any substring of either. Assets are extracted to their VFS
+path, so plugin and engine content keeps its own tree instead of collapsing into `Marvel/Content`.
 
 **Options:**
 - `--filter <patterns...>` - Extract packages matching patterns (space-separated, OR logic)

@@ -45,7 +45,7 @@ jobs:
           dotnet publish src/UAssetTool/UAssetTool.csproj
           -c Release
           -r ${{ matrix.rid }}
-          --self-contained
+          --no-self-contained
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:Version=${{ steps.version.outputs.value }}

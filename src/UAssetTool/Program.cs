@@ -57,6 +57,7 @@ public partial class Program
                 "inspect_zen" => CliInspectZen(args),
                 "create_pak" => CliCreatePak(args),
                 "create_companion_pak" => CliCreateCompanionPak(args),
+                "pak_fixer" => CliPakFixer(args),
                 "create_iostore_bundle" => CliCreateIoStoreBundle(args),
                 "create_mod_iostore" => CliCreateModIoStore(args),
                 "extract_iostore" => CliExtractIoStore(args),
@@ -186,7 +187,14 @@ public partial class Program
         Console.WriteLine("    create_mod_iostore <output> <inputs...>  - Convert legacy assets and create IoStore bundle (add --hybrid to embed non-Unreal files in the companion PAK)");
         Console.WriteLine("    to_zen <uasset> [--no-material-tags] - Convert legacy to Zen format");
         Console.WriteLine("    create_pak <output.pak> <files...>       - Create encrypted PAK file");
-        Console.WriteLine("    create_companion_pak <output.pak> <files...> - Create companion PAK for IoStore");
+        Console.WriteLine("    create_companion_pak <output.pak> [files...] - Create companion PAK for IoStore");
+        Console.WriteLine("      Writes an empty 400-byte stub by default (all the loader needs).");
+        Console.WriteLine("      Options: --chunknames  - also embed the legacy chunknames manifest");
+        Console.WriteLine("    pak_fixer <pak_or_dir> [options]         - Rewrite companion PAKs without the chunknames manifest");
+        Console.WriteLine("      Options: --dry-run     - report what would change, write nothing");
+        Console.WriteLine("               --encrypt     - also AES-encrypt the sibling .utoc/.ucas container");
+        Console.WriteLine("               --backup      - keep a .pak.bak beside each rewritten pak");
+        Console.WriteLine("               --aes-key <hex>");
         Console.WriteLine("    create_iostore_bundle <output> <files...> - Create complete IoStore bundle");
         Console.WriteLine();
         Console.WriteLine("  Extraction:");
@@ -454,24 +462,29 @@ public partial class Program
 
     private static int CliCreateCompanionPak(string[] args)
     {
-        if (args.Length < 3)
+        if (args.Length < 2)
         {
-            Console.Error.WriteLine("Usage: UAssetTool create_companion_pak <output.pak> <file_path1> [file_path2] ...");
+            Console.Error.WriteLine("Usage: UAssetTool create_companion_pak <output.pak> [file_path1] [file_path2] ...");
             Console.Error.WriteLine("  Creates a companion PAK file for IoStore bundles.");
-            Console.Error.WriteLine("  The PAK contains a 'chunknames' entry listing all provided file paths.");
+            Console.Error.WriteLine("  By default this is an empty 400-byte stub: the loader only needs the .pak to");
+            Console.Error.WriteLine("  exist so it opens the sibling .utoc/.ucas. File paths are then ignored.");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Options:");
-            Console.Error.WriteLine("  --mount-point <path>  - Mount point (default: ../../../)");
+            Console.Error.WriteLine("  --chunknames          - embed the legacy 'chunknames' manifest listing the paths");
+            Console.Error.WriteLine("  --raw <inPak>=<file>  - embed a real loose entry (audio/.bnk, .png, .bin); repeatable");
+            Console.Error.WriteLine("  --mount-point <path>  - Mount point (default: ../../../, forced to / when empty)");
             Console.Error.WriteLine("  --path-hash-seed <n>  - Path hash seed (default: 0)");
             Console.Error.WriteLine("  --aes-key <hex>       - AES key in hex format");
             return 1;
         }
 
         string outputPath = args[1];
-        string mountPoint = "../../../";
+        string mountPoint = IoStore.ChunkNamesPakWriter.ContentMountPoint;
         ulong pathHashSeed = 0;
         string? aesKey = null;
+        bool includeChunkNames = false;
         var filePaths = new List<string>();
+        var rawEntries = new List<(string inPakPath, byte[] data)>();
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -487,6 +500,28 @@ public partial class Program
             {
                 aesKey = args[++i];
             }
+            else if (args[i] == "--chunknames")
+            {
+                includeChunkNames = true;
+            }
+            else if (args[i] == "--raw" && i + 1 < args.Length)
+            {
+                string spec = args[++i];
+                int eq = spec.IndexOf('=');
+                if (eq <= 0 || eq == spec.Length - 1)
+                {
+                    Console.Error.WriteLine($"Error: --raw expects <inPakPath>=<localFile>, got '{spec}'");
+                    return 1;
+                }
+                string inPak = spec[..eq];
+                string local = spec[(eq + 1)..];
+                if (!File.Exists(local))
+                {
+                    Console.Error.WriteLine($"Error: --raw source not found: {local}");
+                    return 1;
+                }
+                rawEntries.Add((inPak, File.ReadAllBytes(local)));
+            }
             else
             {
                 // Add as a file path (doesn't need to exist - just a path string)
@@ -494,17 +529,21 @@ public partial class Program
             }
         }
 
-        if (filePaths.Count == 0)
+        if (includeChunkNames && filePaths.Count == 0)
         {
-            Console.Error.WriteLine("Error: No file paths provided");
+            Console.Error.WriteLine("Error: --chunknames requires at least one file path");
             return 1;
         }
 
         try
         {
-            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey);
+            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey,
+                rawEntries.Count > 0 ? rawEntries : null, includeChunkNames);
             Console.WriteLine($"SUCCESS: Created companion PAK at {outputPath}");
-            Console.WriteLine($"  Files listed: {filePaths.Count}");
+            if (includeChunkNames)
+                Console.WriteLine($"  Files listed: {filePaths.Count}");
+            else
+                Console.WriteLine($"  Empty stub ({new FileInfo(outputPath).Length} bytes)");
             return 0;
         }
         catch (Exception ex)
@@ -512,6 +551,78 @@ public partial class Program
             Console.Error.WriteLine($"ERROR: {ex.Message}");
             return 1;
         }
+    }
+
+    private static int CliPakFixer(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool pak_fixer <pak_or_directory> [options]");
+            Console.Error.WriteLine("  Rewrites companion PAKs without the 'chunknames' manifest entry.");
+            Console.Error.WriteLine("  The manifest lists, in plaintext, every game asset a bundle replaces; the");
+            Console.Error.WriteLine("  loader never reads it. Paks holding only the manifest become 400-byte stubs.");
+            Console.Error.WriteLine("  Hybrid payload entries (.bnk/.wem/.png/.bin) are preserved.");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Options:");
+            Console.Error.WriteLine("  --dry-run        - report what would change, write nothing");
+            Console.Error.WriteLine("  --backup         - keep .bak copies beside each rewritten file");
+            Console.Error.WriteLine("  --encrypt        - also rewrite the sibling .utoc/.ucas with AES-encrypted");
+            Console.Error.WriteLine("                     chunks and the Encrypted container flag (same result as");
+            Console.Error.WriteLine("                     create_mod_iostore --obfuscate). Rewrites the container");
+            Console.Error.WriteLine("                     payload, not just a header bit. Skips already-encrypted");
+            Console.Error.WriteLine("                     containers and pak-only mods.");
+            Console.Error.WriteLine("  --aes-key <hex>  - AES key in hex format");
+            return 1;
+        }
+
+        string target = args[1];
+        bool dryRun = false;
+        bool backup = false;
+        bool encrypt = false;
+        string? aesKey = null;
+
+        for (int i = 2; i < args.Length; i++)
+        {
+            if (args[i] == "--dry-run") dryRun = true;
+            else if (args[i] == "--backup") backup = true;
+            else if (args[i] == "--encrypt") encrypt = true;
+            else if (args[i] == "--aes-key" && i + 1 < args.Length) aesKey = args[++i];
+        }
+
+        if (!File.Exists(target) && !Directory.Exists(target))
+        {
+            Console.Error.WriteLine($"ERROR: not found: {target}");
+            return 1;
+        }
+
+        var results = IoStore.PakFixer.FixPath(target, aesKey, dryRun, backup, encrypt);
+
+        foreach (var r in results)
+            Console.WriteLine(r.ToString());
+
+        int fixedCount = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.RewrittenAsStub
+                                         || r.Outcome == IoStore.PakFixer.FixOutcome.RewrittenWithPayload);
+        int clean = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.AlreadyClean);
+        int failed = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.Failed);
+
+        Console.WriteLine();
+        Console.WriteLine($"{(dryRun ? "Would fix" : "Fixed")}: {fixedCount}   already clean: {clean}   failed: {failed}   (of {results.Count} paks)");
+
+        if (encrypt)
+        {
+            int enc = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Encrypted);
+            int already = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.AlreadyEncrypted);
+            int cfail = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Failed);
+            int skipped = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.NotAttempted);
+            Console.WriteLine($"Containers {(dryRun ? "to encrypt" : "encrypted")}: {enc}   already encrypted: {already}   " +
+                              $"failed: {cfail}   no container: {skipped}");
+            failed += cfail;
+        }
+
+        if (dryRun)
+            Console.WriteLine("Dry run - nothing written. Re-run without --dry-run to apply.");
+
+        return failed > 0 ? 1 : 0;
     }
 
     private static int CliCreateIoStoreBundle(string[] args)
@@ -1382,6 +1493,9 @@ public partial class Program
             Console.Error.WriteLine("  --container <path>       Additional container to load for cross-package imports");
             Console.Error.WriteLine("  --aes <hex>              AES key for decryption (can specify multiple times)");
             Console.Error.WriteLine("  --filter <patterns...>   Only extract packages matching patterns (space-separated)");
+            Console.Error.WriteLine("                           Matches VFS paths as CUE4Parse spells them");
+            Console.Error.WriteLine("                           (Marvel/Content/..., Marvel/Plugins/<Plugin>/Content/...,");
+            Console.Error.WriteLine("                           Engine/Content/...) and mount paths (/Game/..., /Engine/...)");
             Console.Error.WriteLine("                           Can also pass a .txt file containing one pattern per line");
             Console.Error.WriteLine("  --with-deps              Also extract imported/referenced packages");
             Console.Error.WriteLine("  --mod <path>             Path to modded .utoc file or directory containing .utoc files.");
@@ -1392,6 +1506,8 @@ public partial class Program
             Console.Error.WriteLine("Examples:");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter SK_1014 SK_1057 SK_1036");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Characters/1014 Characters/1057");
+            Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Marvel/Plugins/MarvelGAS/Content/Marvel/AbilitySystem/1053");
+            Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Engine/Plugins/FX/Niagara/Content");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --mod \"C:/Mods/my_mod.utoc\" --filter SK_1014");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --mod \"C:/Mods/\" --with-deps");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter filters.txt");
@@ -1611,56 +1727,60 @@ public partial class Program
             }
             else if (filterPatterns.Count > 0)
             {
-                packageIds = new List<ulong>();
-                
+                // Exact paths resolve by lookup; substrings share one pass over the list.
+                var selected = new HashSet<ulong>();
+                var scanPatterns = new List<string>();
+
                 foreach (var filterPattern in filterPatterns)
                 {
-                    // Check if filter looks like an exact package path (starts with /Game/)
-                    if (filterPattern.StartsWith("/Game/"))
+                    if (filterPattern.StartsWith("/"))
                     {
-                        // Direct lookup by package path - much faster than iterating all packages
                         ulong packageId = ZenPackage.FPackageId.FromName(filterPattern);
                         if (context.HasPackage(packageId))
                         {
-                            if (!packageIds.Contains(packageId))
-                                packageIds.Add(packageId);
+                            selected.Add(packageId);
                             Console.WriteLine($"Direct lookup: found package {filterPattern}");
-                        }
-                        else
-                        {
-                            // Try partial match as fallback
-                            var found = context.FindPackageIdByPath(filterPattern);
-                            if (found.HasValue && !packageIds.Contains(found.Value))
-                            {
-                                packageIds.Add(found.Value);
-                                Console.WriteLine($"Found package by partial match: {context.GetPackagePath(found.Value)}");
-                            }
-                            else if (!found.HasValue)
-                            {
-                                Console.Error.WriteLine($"Warning: Package not found: {filterPattern}");
-                            }
+                            continue;
                         }
                     }
                     else
                     {
-                        // Partial filter - search through all packages (slower)
-                        int matchCount = 0;
-                        foreach (var pkgId in context.GetAllPackageIds())
+                        var byVfs = context.FindPackageIdByVfsPath(filterPattern);
+                        if (byVfs.HasValue)
                         {
-                            string? path = context.GetPackagePath(pkgId);
-                            if (!string.IsNullOrEmpty(path) && path.Contains(filterPattern, StringComparison.OrdinalIgnoreCase))
-                            {
-                                if (!packageIds.Contains(pkgId))
-                                {
-                                    packageIds.Add(pkgId);
-                                    matchCount++;
-                                }
-                            }
+                            selected.Add(byVfs.Value);
+                            Console.WriteLine($"Direct lookup: found package {context.GetContainerPath(byVfs.Value)}");
+                            continue;
                         }
-                        Console.WriteLine($"Filter '{filterPattern}' matched {matchCount} packages");
+                    }
+
+                    scanPatterns.Add(filterPattern);
+                }
+
+                if (scanPatterns.Count > 0)
+                {
+                    var matchCounts = new int[scanPatterns.Count];
+                    foreach (var pkgId in context.GetAllPackageIds())
+                    {
+                        for (int p = 0; p < scanPatterns.Count; p++)
+                        {
+                            if (!context.PathMatchesFilter(pkgId, scanPatterns[p]))
+                                continue;
+                            matchCounts[p]++;
+                            selected.Add(pkgId);
+                        }
+                    }
+
+                    for (int p = 0; p < scanPatterns.Count; p++)
+                    {
+                        if (matchCounts[p] == 0)
+                            Console.Error.WriteLine($"Warning: Filter '{scanPatterns[p]}' matched no packages");
+                        else
+                            Console.WriteLine($"Filter '{scanPatterns[p]}' matched {matchCounts[p]} packages");
                     }
                 }
-                
+
+                packageIds = selected.ToList();
                 skipFilterCheck = true; // Already filtered
                 Console.WriteLine($"Total packages matching filters [{string.Join(", ", filterPatterns)}]: {packageIds.Count}");
             }
@@ -1674,31 +1794,6 @@ public partial class Program
 
             bool debugMode = Environment.GetEnvironmentVariable("DEBUG") == "1";
 
-            // Helper: resolve output path from package name
-            static string ResolveOutputPath(string packageName)
-            {
-                string relPath = packageName;
-                if (relPath.Contains("/../"))
-                {
-                    string tempRoot = Path.GetTempPath();
-                    string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                    string resolved = Path.GetFullPath(tempPath);
-                    relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                    if (!relPath.StartsWith("/")) relPath = "/" + relPath;
-                    int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                    if (contentIdx >= 0)
-                        relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                }
-                if (relPath.StartsWith("/Game/"))
-                    relPath = "Marvel/Content/" + relPath.Substring(6);
-                else if (relPath.StartsWith("/"))
-                    relPath = relPath.Substring(1);
-                relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                    relPath += ".uasset";
-                return relPath;
-            }
-
             // Helper function to extract a single package (thread-safe)
             List<ulong> ExtractPackage(ulong packageId, bool isDependency)
             {
@@ -1711,9 +1806,7 @@ public partial class Program
 
                 if (!isDependency && !skipFilterCheck && filterPatterns.Count > 0)
                 {
-                    bool matchesAnyFilter = filterPatterns.Any(filter =>
-                        !string.IsNullOrEmpty(fullPath) && fullPath.Contains(filter, StringComparison.OrdinalIgnoreCase));
-                    if (!matchesAnyFilter)
+                    if (!filterPatterns.Any(filter => context.PathMatchesFilter(packageId, filter)))
                         return imports;
                 }
 
@@ -1750,16 +1843,7 @@ public partial class Program
                         imports.AddRange(converter.GetImportedPackageIds());
                     }
 
-                    // Prefer the path the package actually occupies in the container. Deriving
-                    // a location from the package name instead cannot place anything outside
-                    // Marvel/Content: it has no way to know that /MarvelGAS/ lives under
-                    // Marvel/Plugins/MarvelGAS/Content, or /Niagara/ under
-                    // Engine/Plugins/FX/Niagara/Content, so those collapsed into the main
-                    // content tree and 67 plugin packages landed on top of real ones.
-                    string? containerPath = context.GetContainerPath(packageId);
-                    string relPath = !string.IsNullOrEmpty(containerPath)
-                        ? containerPath.Replace('/', Path.DirectorySeparatorChar)
-                        : ResolveOutputPath(packageName);
+                    string relPath = ResolveVfsOutputPath(context, packageId, packageName);
                     string outputAssetPath = Path.Combine(outputDir, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
@@ -2785,6 +2869,7 @@ public partial class Program
                 "extract_pak_all" => ExtractPakAll(request.FilePath, request.OutputPath, request.AesKey),
                 "create_pak" => CreatePakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey, request.BasePath),
                 "create_companion_pak" => CreateCompanionPakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey),
+                "pak_fixer" => PakFixerJson(request.FilePath ?? request.InputDir, request.AesKey, request.DryRun, request.Obfuscate),
                 
                 // IoStore operations
                 "list_iostore_files" => ListIoStoreFiles(request.FilePath, request.AesKey, request.IncludeTypes, request.ScriptObjectsPath, request.GamePaks, request.TypeFilter),
@@ -6305,35 +6390,92 @@ public partial class Program
     }
     
     /// <summary>
-    /// Create a companion PAK file for IoStore bundles (contains chunknames)
+    /// Create a companion PAK file for IoStore bundles.
+    /// Writes an empty 400-byte stub -- the loader only needs the .pak to exist so it opens
+    /// the sibling .utoc/.ucas. filePaths is accepted for API compatibility and ignored.
     /// </summary>
     private static UAssetResponse CreateCompanionPakJson(string? outputPath, List<string>? filePaths, string? mountPoint, ulong pathHashSeed, string? aesKey)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
-        if (filePaths == null || filePaths.Count == 0)
-            return new UAssetResponse { Success = false, Message = "File paths are required" };
-        
+
         try
         {
-            mountPoint ??= "../../../";
-            
-            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey);
-            
+            mountPoint ??= IoStore.ChunkNamesPakWriter.ContentMountPoint;
+
+            IoStore.ChunkNamesPakWriter.Create(
+                outputPath,
+                filePaths ?? new List<string>(),
+                mountPoint,
+                pathHashSeed,
+                aesKey,
+                null,
+                includeChunkNames: false);
+
             return new UAssetResponse
             {
                 Success = true,
-                Message = $"Created companion PAK listing {filePaths.Count} files",
+                Message = "Created companion PAK (empty stub)",
                 Data = new Dictionary<string, object?>
                 {
                     ["output_path"] = outputPath,
-                    ["file_count"] = filePaths.Count
+                    ["file_count"] = 0,
+                    ["size_bytes"] = new FileInfo(outputPath).Length
                 }
             };
         }
         catch (Exception ex)
         {
             return new UAssetResponse { Success = false, Message = $"Failed to create companion PAK: {ex.Message}" };
+        }
+    }
+
+    /// <summary>
+    /// Rewrite companion PAKs under a path without the chunknames manifest.
+    /// </summary>
+    private static UAssetResponse PakFixerJson(string? targetPath, string? aesKey, bool dryRun, bool encrypt = false)
+    {
+        if (string.IsNullOrEmpty(targetPath))
+            return new UAssetResponse { Success = false, Message = "File path is required" };
+        if (!File.Exists(targetPath) && !Directory.Exists(targetPath))
+            return new UAssetResponse { Success = false, Message = $"Not found: {targetPath}" };
+
+        try
+        {
+            var results = IoStore.PakFixer.FixPath(targetPath, aesKey, dryRun, backup: false, encryptContainer: encrypt);
+
+            return new UAssetResponse
+            {
+                Success = results.All(r => r.Outcome != IoStore.PakFixer.FixOutcome.Failed),
+                Message = $"{(dryRun ? "Would fix" : "Fixed")} {results.Count(r => r.Outcome is IoStore.PakFixer.FixOutcome.RewrittenAsStub or IoStore.PakFixer.FixOutcome.RewrittenWithPayload)} of {results.Count} paks",
+                Data = new Dictionary<string, object?>
+                {
+                    ["dry_run"] = dryRun,
+                    ["total"] = results.Count,
+                    ["fixed"] = results.Count(r => r.Outcome is IoStore.PakFixer.FixOutcome.RewrittenAsStub or IoStore.PakFixer.FixOutcome.RewrittenWithPayload),
+                    ["already_clean"] = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.AlreadyClean),
+                    ["failed"] = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.Failed),
+                    ["containers_encrypted"] = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Encrypted),
+                    ["containers_already_encrypted"] = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.AlreadyEncrypted),
+                    ["containers_failed"] = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Failed),
+                    ["results"] = results.Select(r => new Dictionary<string, object?>
+                    {
+                        ["pak"] = r.PakPath,
+                        ["outcome"] = r.Outcome.ToString(),
+                        ["entries_before"] = r.EntriesBefore,
+                        ["entries_after"] = r.EntriesAfter,
+                        ["size_before"] = r.SizeBefore,
+                        ["size_after"] = r.SizeAfter,
+                        ["error"] = r.Error,
+                        ["container"] = r.Container.ToString(),
+                        ["container_error"] = r.ContainerError
+                    }).ToList()
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new UAssetResponse { Success = false, Message = $"pak_fixer failed: {ex.Message}" };
         }
     }
     
@@ -6474,13 +6616,58 @@ public partial class Program
     ///   /Game/X                    → Marvel/Content/X
     ///   Marvel/Content/X           → Marvel/Content/X (no change)
     /// </summary>
+    /// <summary>
+    /// VFS output path for a package, the way CUE4Parse spells it.
+    /// </summary>
+    private static string ResolveVfsOutputPath(ZenPackage.FZenPackageContext context, ulong packageId, string packageName)
+    {
+        // A cooked VFS path always has a /Content/ segment; a mod container may index by mount.
+        string? containerPath = context.GetContainerPath(packageId);
+        string relPath;
+
+        if (!string.IsNullOrEmpty(containerPath) && containerPath.Contains("/Content/", StringComparison.OrdinalIgnoreCase))
+        {
+            relPath = containerPath;
+        }
+        else
+        {
+            relPath = packageName;
+
+            if (relPath.Contains("/../"))
+            {
+                string tempRoot = Path.GetTempPath();
+                string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                string resolved = Path.GetFullPath(tempPath);
+                relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
+                if (!relPath.StartsWith("/")) relPath = "/" + relPath;
+                int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+                if (contentIdx >= 0)
+                    relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
+            }
+
+            string? mounted = context.ResolveMountToVfsPath(relPath);
+            if (!string.IsNullOrEmpty(mounted))
+                relPath = mounted;
+            else if (relPath.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
+                relPath = "Engine/Content/" + relPath.Substring(8);
+            else if (!string.IsNullOrEmpty(containerPath))
+                relPath = containerPath;
+            else
+                relPath = ResolveGamePathToContent(relPath);
+        }
+
+        relPath = relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+        if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
+            !relPath.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+            relPath += ".uasset";
+        return relPath;
+    }
+
     private static string ResolveGamePathToContent(string path)
     {
-        // Strip leading ../../../ (mount point prefix)
-        string p = path;
-        while (p.StartsWith("../"))
-            p = p.Substring(3);
-        
+        // Handles a mount prefix that the directory index repeated, not just a leading one.
+        string p = VfsPath.StripMountPrefix(path);
+
         // Convert /Game/X → Marvel/Content/X
         if (p.StartsWith("/Game/"))
             p = "Marvel/Content" + p.Substring(5);
@@ -6677,31 +6864,8 @@ public partial class Program
                     // Convert to legacy format using ZenToLegacyConverter
                     var converter = new ZenPackage.ZenToLegacyConverter(context, packageId);
                     var legacyBundle = converter.Convert();
-                    
-                    // Normalize path for output
-                    string relPath = packageName;
-                    
-                    // Resolve /../ patterns
-                    if (relPath.Contains("/../"))
-                    {
-                        string tempRoot = Path.GetTempPath();
-                        string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                        string resolved = Path.GetFullPath(tempPath);
-                        relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                        if (!relPath.StartsWith("/"))
-                            relPath = "/" + relPath;
-                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                        if (contentIdx >= 0)
-                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                    }
-                    
-                    // Resolve /Game/ to Marvel/Content/ for on-disk folder structure
-                    relPath = ResolveGamePathToContent(relPath);
-                    
-                    relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                    if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                        relPath += ".uasset";
-                    
+
+                    string relPath = ResolveVfsOutputPath(context, packageId, packageName);
                     string outputAssetPath = Path.Combine(outputDir, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
@@ -6863,18 +7027,9 @@ public partial class Program
             // Apply filter patterns if specified
             if (filterPatterns != null && filterPatterns.Count > 0)
             {
-                var filtered = new List<ulong>();
-                foreach (var packageId in packagesToExtract)
-                {
-                    string? path = context.GetPackagePath(packageId);
-                    if (string.IsNullOrEmpty(path)) continue;
-
-                    // Check if path matches any filter pattern
-                    bool matches = filterPatterns.Any(pattern =>
-                        path.Contains(pattern, StringComparison.OrdinalIgnoreCase));
-
-                    if (matches) filtered.Add(packageId);
-                }
+                var filtered = packagesToExtract
+                    .Where(id => filterPatterns.Any(pattern => context.PathMatchesFilter(id, pattern)))
+                    .ToList();
                 packagesToExtract = filtered;
                 Console.Error.WriteLine($"[ExtractIoStoreLegacy] Filtered to {packagesToExtract.Count()} packages matching patterns");
             }
@@ -6912,26 +7067,7 @@ public partial class Program
                     if (withDeps)
                         imports.AddRange(converter.GetImportedPackageIds());
 
-                    // Resolve path and write files (same logic as ExtractIoStoreJson)
-                    string relPath = packageName;
-                    if (relPath.Contains("/../"))
-                    {
-                        string tempRoot = Path.GetTempPath();
-                        string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                        string resolved = Path.GetFullPath(tempPath);
-                        relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                        if (!relPath.StartsWith("/"))
-                            relPath = "/" + relPath;
-                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                        if (contentIdx >= 0)
-                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                    }
-
-                    relPath = ResolveGamePathToContent(relPath);
-                    relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                    if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                        relPath += ".uasset";
-
+                    string relPath = ResolveVfsOutputPath(context, packageId, packageName);
                     string outputAssetPath = Path.Combine(outputPath, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
@@ -7624,6 +7760,12 @@ public class UAssetRequest
 
     [JsonPropertyName("compress")]
     public bool Compress { get; set; } = true;
+
+    /// <summary>
+    /// Report what would change without writing (pak_fixer)
+    /// </summary>
+    [JsonPropertyName("dry_run")]
+    public bool DryRun { get; set; } = false;
     
     [JsonPropertyName("filter_patterns")]
     public List<string>? FilterPatterns { get; set; }
