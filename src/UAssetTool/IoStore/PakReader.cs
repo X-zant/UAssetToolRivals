@@ -37,6 +37,7 @@ public class PakReader : IDisposable
     
     // Index data
     private readonly Dictionary<string, PakEntry> _entries = new();
+    private int _skippedInherited;
     
     // Cache for encryption limits (path -> limit) to avoid re-hashing on repeat access
     // ConcurrentDictionary so Get() is safe to call from Parallel.ForEach
@@ -316,10 +317,25 @@ public class PakReader : IDisposable
                 {
                     string filename = ReadString(fdiReader);
                     uint encodedOffset = fdiReader.ReadUInt32();
-                    
+
                     // Combine directory and filename
                     string fullPath = directory + filename;
-                    
+
+                    // The directory index gives each file an offset into the encoded-entries
+                    // blob. A patch pak also lists every file it does NOT change - the whole
+                    // base-game namespace - and marks those with 0x80000000 (the "not stored
+                    // here, inherit from the base pak" sentinel) instead of a real offset. Its
+                    // data is not in this pak, so there is nothing to read; recording it as an
+                    // entry would point at bytes that are not present. Treating the sentinel as
+                    // a real offset also threw and aborted the whole pak. A full patch pak can
+                    // carry over a million of these, so this is the common case, not an error.
+                    const uint InheritFromBaseSentinel = 0x80000000u;
+                    if ((encodedOffset & InheritFromBaseSentinel) != 0)
+                    {
+                        _skippedInherited++;
+                        continue;
+                    }
+
                     // Parse encoded entry at this offset
                     var entry = ParseEncodedEntry(encodedEntriesData, (int)encodedOffset);
                     _entries[fullPath] = entry;
@@ -328,6 +344,8 @@ public class PakReader : IDisposable
         }
 
         Console.Error.WriteLine($"[PakReader] Loaded {_entries.Count} entries from PAK");
+        if (_skippedInherited > 0)
+            Console.Error.WriteLine($"[PakReader] {_skippedInherited} files inherited from base pak (no data in this patch pak)");
         Console.Error.WriteLine($"[PakReader] Compression methods: [{string.Join(", ", _compressionMethods.Where(m => !string.IsNullOrEmpty(m)))}]");
         
         // Debug: print first few entries
