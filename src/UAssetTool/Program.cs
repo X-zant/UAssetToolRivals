@@ -57,7 +57,6 @@ public partial class Program
                 "inspect_zen" => CliInspectZen(args),
                 "create_pak" => CliCreatePak(args),
                 "create_companion_pak" => CliCreateCompanionPak(args),
-                "pak_fixer" => CliPakFixer(args),
                 "create_iostore_bundle" => CliCreateIoStoreBundle(args),
                 "create_mod_iostore" => CliCreateModIoStore(args),
                 "extract_iostore" => CliExtractIoStore(args),
@@ -187,14 +186,7 @@ public partial class Program
         Console.WriteLine("    create_mod_iostore <output> <inputs...>  - Convert legacy assets and create IoStore bundle (add --hybrid to embed non-Unreal files in the companion PAK)");
         Console.WriteLine("    to_zen <uasset> [--no-material-tags] - Convert legacy to Zen format");
         Console.WriteLine("    create_pak <output.pak> <files...>       - Create encrypted PAK file");
-        Console.WriteLine("    create_companion_pak <output.pak> [files...] - Create companion PAK for IoStore");
-        Console.WriteLine("      Writes an empty 400-byte stub by default (all the loader needs).");
-        Console.WriteLine("      Options: --chunknames  - also embed the legacy chunknames manifest");
-        Console.WriteLine("    pak_fixer <pak_or_dir> [options]         - Rewrite companion PAKs without the chunknames manifest");
-        Console.WriteLine("      Options: --dry-run     - report what would change, write nothing");
-        Console.WriteLine("               --encrypt     - also AES-encrypt the sibling .utoc/.ucas container");
-        Console.WriteLine("               --backup      - keep a .pak.bak beside each rewritten pak");
-        Console.WriteLine("               --aes-key <hex>");
+        Console.WriteLine("    create_companion_pak <output.pak> <files...> - Create companion PAK for IoStore");
         Console.WriteLine("    create_iostore_bundle <output> <files...> - Create complete IoStore bundle");
         Console.WriteLine();
         Console.WriteLine("  Extraction:");
@@ -462,29 +454,24 @@ public partial class Program
 
     private static int CliCreateCompanionPak(string[] args)
     {
-        if (args.Length < 2)
+        if (args.Length < 3)
         {
-            Console.Error.WriteLine("Usage: UAssetTool create_companion_pak <output.pak> [file_path1] [file_path2] ...");
+            Console.Error.WriteLine("Usage: UAssetTool create_companion_pak <output.pak> <file_path1> [file_path2] ...");
             Console.Error.WriteLine("  Creates a companion PAK file for IoStore bundles.");
-            Console.Error.WriteLine("  By default this is an empty 400-byte stub: the loader only needs the .pak to");
-            Console.Error.WriteLine("  exist so it opens the sibling .utoc/.ucas. File paths are then ignored.");
+            Console.Error.WriteLine("  The PAK contains a 'chunknames' entry listing all provided file paths.");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Options:");
-            Console.Error.WriteLine("  --chunknames          - embed the legacy 'chunknames' manifest listing the paths");
-            Console.Error.WriteLine("  --raw <inPak>=<file>  - embed a real loose entry (audio/.bnk, .png, .bin); repeatable");
-            Console.Error.WriteLine("  --mount-point <path>  - Mount point (default: ../../../, forced to / when empty)");
+            Console.Error.WriteLine("  --mount-point <path>  - Mount point (default: ../../../)");
             Console.Error.WriteLine("  --path-hash-seed <n>  - Path hash seed (default: 0)");
             Console.Error.WriteLine("  --aes-key <hex>       - AES key in hex format");
             return 1;
         }
 
         string outputPath = args[1];
-        string mountPoint = IoStore.ChunkNamesPakWriter.ContentMountPoint;
+        string mountPoint = "../../../";
         ulong pathHashSeed = 0;
         string? aesKey = null;
-        bool includeChunkNames = false;
         var filePaths = new List<string>();
-        var rawEntries = new List<(string inPakPath, byte[] data)>();
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -500,28 +487,6 @@ public partial class Program
             {
                 aesKey = args[++i];
             }
-            else if (args[i] == "--chunknames")
-            {
-                includeChunkNames = true;
-            }
-            else if (args[i] == "--raw" && i + 1 < args.Length)
-            {
-                string spec = args[++i];
-                int eq = spec.IndexOf('=');
-                if (eq <= 0 || eq == spec.Length - 1)
-                {
-                    Console.Error.WriteLine($"Error: --raw expects <inPakPath>=<localFile>, got '{spec}'");
-                    return 1;
-                }
-                string inPak = spec[..eq];
-                string local = spec[(eq + 1)..];
-                if (!File.Exists(local))
-                {
-                    Console.Error.WriteLine($"Error: --raw source not found: {local}");
-                    return 1;
-                }
-                rawEntries.Add((inPak, File.ReadAllBytes(local)));
-            }
             else
             {
                 // Add as a file path (doesn't need to exist - just a path string)
@@ -529,21 +494,17 @@ public partial class Program
             }
         }
 
-        if (includeChunkNames && filePaths.Count == 0)
+        if (filePaths.Count == 0)
         {
-            Console.Error.WriteLine("Error: --chunknames requires at least one file path");
+            Console.Error.WriteLine("Error: No file paths provided");
             return 1;
         }
 
         try
         {
-            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey,
-                rawEntries.Count > 0 ? rawEntries : null, includeChunkNames);
+            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey);
             Console.WriteLine($"SUCCESS: Created companion PAK at {outputPath}");
-            if (includeChunkNames)
-                Console.WriteLine($"  Files listed: {filePaths.Count}");
-            else
-                Console.WriteLine($"  Empty stub ({new FileInfo(outputPath).Length} bytes)");
+            Console.WriteLine($"  Files listed: {filePaths.Count}");
             return 0;
         }
         catch (Exception ex)
@@ -551,78 +512,6 @@ public partial class Program
             Console.Error.WriteLine($"ERROR: {ex.Message}");
             return 1;
         }
-    }
-
-    private static int CliPakFixer(string[] args)
-    {
-        if (args.Length < 2)
-        {
-            Console.Error.WriteLine("Usage: UAssetTool pak_fixer <pak_or_directory> [options]");
-            Console.Error.WriteLine("  Rewrites companion PAKs without the 'chunknames' manifest entry.");
-            Console.Error.WriteLine("  The manifest lists, in plaintext, every game asset a bundle replaces; the");
-            Console.Error.WriteLine("  loader never reads it. Paks holding only the manifest become 400-byte stubs.");
-            Console.Error.WriteLine("  Hybrid payload entries (.bnk/.wem/.png/.bin) are preserved.");
-            Console.Error.WriteLine();
-            Console.Error.WriteLine("Options:");
-            Console.Error.WriteLine("  --dry-run        - report what would change, write nothing");
-            Console.Error.WriteLine("  --backup         - keep .bak copies beside each rewritten file");
-            Console.Error.WriteLine("  --encrypt        - also rewrite the sibling .utoc/.ucas with AES-encrypted");
-            Console.Error.WriteLine("                     chunks and the Encrypted container flag (same result as");
-            Console.Error.WriteLine("                     create_mod_iostore --obfuscate). Rewrites the container");
-            Console.Error.WriteLine("                     payload, not just a header bit. Skips already-encrypted");
-            Console.Error.WriteLine("                     containers and pak-only mods.");
-            Console.Error.WriteLine("  --aes-key <hex>  - AES key in hex format");
-            return 1;
-        }
-
-        string target = args[1];
-        bool dryRun = false;
-        bool backup = false;
-        bool encrypt = false;
-        string? aesKey = null;
-
-        for (int i = 2; i < args.Length; i++)
-        {
-            if (args[i] == "--dry-run") dryRun = true;
-            else if (args[i] == "--backup") backup = true;
-            else if (args[i] == "--encrypt") encrypt = true;
-            else if (args[i] == "--aes-key" && i + 1 < args.Length) aesKey = args[++i];
-        }
-
-        if (!File.Exists(target) && !Directory.Exists(target))
-        {
-            Console.Error.WriteLine($"ERROR: not found: {target}");
-            return 1;
-        }
-
-        var results = IoStore.PakFixer.FixPath(target, aesKey, dryRun, backup, encrypt);
-
-        foreach (var r in results)
-            Console.WriteLine(r.ToString());
-
-        int fixedCount = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.RewrittenAsStub
-                                         || r.Outcome == IoStore.PakFixer.FixOutcome.RewrittenWithPayload);
-        int clean = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.AlreadyClean);
-        int failed = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.Failed);
-
-        Console.WriteLine();
-        Console.WriteLine($"{(dryRun ? "Would fix" : "Fixed")}: {fixedCount}   already clean: {clean}   failed: {failed}   (of {results.Count} paks)");
-
-        if (encrypt)
-        {
-            int enc = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Encrypted);
-            int already = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.AlreadyEncrypted);
-            int cfail = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Failed);
-            int skipped = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.NotAttempted);
-            Console.WriteLine($"Containers {(dryRun ? "to encrypt" : "encrypted")}: {enc}   already encrypted: {already}   " +
-                              $"failed: {cfail}   no container: {skipped}");
-            failed += cfail;
-        }
-
-        if (dryRun)
-            Console.WriteLine("Dry run - nothing written. Re-run without --dry-run to apply.");
-
-        return failed > 0 ? 1 : 0;
     }
 
     private static int CliCreateIoStoreBundle(string[] args)
@@ -2869,7 +2758,6 @@ public partial class Program
                 "extract_pak_all" => ExtractPakAll(request.FilePath, request.OutputPath, request.AesKey),
                 "create_pak" => CreatePakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey, request.BasePath),
                 "create_companion_pak" => CreateCompanionPakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey),
-                "pak_fixer" => PakFixerJson(request.FilePath ?? request.InputDir, request.AesKey, request.DryRun, request.Obfuscate),
                 
                 // IoStore operations
                 "list_iostore_files" => ListIoStoreFiles(request.FilePath, request.AesKey, request.IncludeTypes, request.ScriptObjectsPath, request.GamePaks, request.TypeFilter),
@@ -6390,92 +6278,35 @@ public partial class Program
     }
     
     /// <summary>
-    /// Create a companion PAK file for IoStore bundles.
-    /// Writes an empty 400-byte stub -- the loader only needs the .pak to exist so it opens
-    /// the sibling .utoc/.ucas. filePaths is accepted for API compatibility and ignored.
+    /// Create a companion PAK file for IoStore bundles (contains chunknames)
     /// </summary>
     private static UAssetResponse CreateCompanionPakJson(string? outputPath, List<string>? filePaths, string? mountPoint, ulong pathHashSeed, string? aesKey)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
-
+        if (filePaths == null || filePaths.Count == 0)
+            return new UAssetResponse { Success = false, Message = "File paths are required" };
+        
         try
         {
-            mountPoint ??= IoStore.ChunkNamesPakWriter.ContentMountPoint;
-
-            IoStore.ChunkNamesPakWriter.Create(
-                outputPath,
-                filePaths ?? new List<string>(),
-                mountPoint,
-                pathHashSeed,
-                aesKey,
-                null,
-                includeChunkNames: false);
-
+            mountPoint ??= "../../../";
+            
+            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey);
+            
             return new UAssetResponse
             {
                 Success = true,
-                Message = "Created companion PAK (empty stub)",
+                Message = $"Created companion PAK listing {filePaths.Count} files",
                 Data = new Dictionary<string, object?>
                 {
                     ["output_path"] = outputPath,
-                    ["file_count"] = 0,
-                    ["size_bytes"] = new FileInfo(outputPath).Length
+                    ["file_count"] = filePaths.Count
                 }
             };
         }
         catch (Exception ex)
         {
             return new UAssetResponse { Success = false, Message = $"Failed to create companion PAK: {ex.Message}" };
-        }
-    }
-
-    /// <summary>
-    /// Rewrite companion PAKs under a path without the chunknames manifest.
-    /// </summary>
-    private static UAssetResponse PakFixerJson(string? targetPath, string? aesKey, bool dryRun, bool encrypt = false)
-    {
-        if (string.IsNullOrEmpty(targetPath))
-            return new UAssetResponse { Success = false, Message = "File path is required" };
-        if (!File.Exists(targetPath) && !Directory.Exists(targetPath))
-            return new UAssetResponse { Success = false, Message = $"Not found: {targetPath}" };
-
-        try
-        {
-            var results = IoStore.PakFixer.FixPath(targetPath, aesKey, dryRun, backup: false, encryptContainer: encrypt);
-
-            return new UAssetResponse
-            {
-                Success = results.All(r => r.Outcome != IoStore.PakFixer.FixOutcome.Failed),
-                Message = $"{(dryRun ? "Would fix" : "Fixed")} {results.Count(r => r.Outcome is IoStore.PakFixer.FixOutcome.RewrittenAsStub or IoStore.PakFixer.FixOutcome.RewrittenWithPayload)} of {results.Count} paks",
-                Data = new Dictionary<string, object?>
-                {
-                    ["dry_run"] = dryRun,
-                    ["total"] = results.Count,
-                    ["fixed"] = results.Count(r => r.Outcome is IoStore.PakFixer.FixOutcome.RewrittenAsStub or IoStore.PakFixer.FixOutcome.RewrittenWithPayload),
-                    ["already_clean"] = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.AlreadyClean),
-                    ["failed"] = results.Count(r => r.Outcome == IoStore.PakFixer.FixOutcome.Failed),
-                    ["containers_encrypted"] = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Encrypted),
-                    ["containers_already_encrypted"] = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.AlreadyEncrypted),
-                    ["containers_failed"] = results.Count(r => r.Container == IoStore.PakFixer.ContainerOutcome.Failed),
-                    ["results"] = results.Select(r => new Dictionary<string, object?>
-                    {
-                        ["pak"] = r.PakPath,
-                        ["outcome"] = r.Outcome.ToString(),
-                        ["entries_before"] = r.EntriesBefore,
-                        ["entries_after"] = r.EntriesAfter,
-                        ["size_before"] = r.SizeBefore,
-                        ["size_after"] = r.SizeAfter,
-                        ["error"] = r.Error,
-                        ["container"] = r.Container.ToString(),
-                        ["container_error"] = r.ContainerError
-                    }).ToList()
-                }
-            };
-        }
-        catch (Exception ex)
-        {
-            return new UAssetResponse { Success = false, Message = $"pak_fixer failed: {ex.Message}" };
         }
     }
     
@@ -7760,12 +7591,6 @@ public class UAssetRequest
 
     [JsonPropertyName("compress")]
     public bool Compress { get; set; } = true;
-
-    /// <summary>
-    /// Report what would change without writing (pak_fixer)
-    /// </summary>
-    [JsonPropertyName("dry_run")]
-    public bool DryRun { get; set; } = false;
     
     [JsonPropertyName("filter_patterns")]
     public List<string>? FilterPatterns { get; set; }
