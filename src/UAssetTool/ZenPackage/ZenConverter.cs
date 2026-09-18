@@ -169,20 +169,22 @@ public class ZenConverter
         
         gamePathOut = gamePath;
 
-        // Convert /Game/X to Marvel/Content/X for packagePath (used in UTOC directory index)
-        if (gamePath.StartsWith("/Game/"))
-        {
-            packagePath = "Marvel/Content" + gamePath.Substring(5);
-        }
-        else
-        {
-            packagePath = gamePath.TrimStart('/');
-        }
+        // Expand the mount path into the VFS path used by the utoc directory index and the
+        // companion PAK's chunknames. A mount name is not a location, so "/MarvelGAS/X" has
+        // to become Marvel/Plugins/MarvelGAS/Content/X or the bundle records a path that
+        // exists nowhere in the game.
+        packagePath = MountPathToVfsPath(gamePath);
 
-        // A package path names the mount but not where the mount lives, so it cannot say that
-        // /MarvelGAS/X belongs at Marvel/Plugins/MarvelGAS/Content/X. When the caller knows the
-        // root the assets were laid out under, the location on disk answers that directly -
-        // extraction mirrors the container, so the relative path is the directory index entry.
+        // A mount name cannot name a category folder, so Engine/Plugins/FX/Niagara/Content/X
+        // is only knowable from the layout on disk. When the caller passes a root, and the
+        // assets under it are laid out the way extraction wrote them, that layout is the
+        // better answer and replaces the expansion above.
+        //
+        // It replaces it only when it actually is such a layout. A staging folder someone
+        // made to batch-convert a few files says nothing about where those files belong, and
+        // taking it at face value used to record a bare file name, or leak the folder's own
+        // name into the bundle. The test is the one the extractor uses to learn a mount: the
+        // relative path has to end with the package's own tail, sitting under a Content folder.
         if (!string.IsNullOrEmpty(inputRoot))
         {
             string fullAssetPath = Path.GetFullPath(uassetPath);
@@ -194,7 +196,7 @@ public class ZenConverter
                     .TrimStart('/');
                 if (relative.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
                     relative = relative[..^7];
-                if (relative.Length > 0)
+                if (relative.Length > 0 && PlacesMount(relative, gamePath))
                     packagePath = relative;
             }
         }
@@ -1195,6 +1197,68 @@ public class ZenConverter
         return true;
     }
     
+    /// <summary>
+    /// Does <paramref name="relative"/> (a path relative to the input root) actually place
+    /// the package named by <paramref name="mountPath"/>? It does when it ends with the
+    /// package's tail - everything after the mount name - and the folders in front of that
+    /// tail end at a Content folder, which every cooked mount does. That is the same pair
+    /// test FZenPackageContext uses to learn where a mount lives, applied in reverse.
+    ///
+    /// A staging folder fails it, which is the point: only a real cooked layout is allowed
+    /// to override the package's own name.
+    /// </summary>
+    private static bool PlacesMount(string relative, string mountPath)
+    {
+        if (string.IsNullOrEmpty(relative) || string.IsNullOrEmpty(mountPath) || mountPath[0] != '/')
+            return false;
+
+        int secondSlash = mountPath.IndexOf('/', 1);
+        if (secondSlash < 0)
+            return false;
+
+        string tail = mountPath[(secondSlash + 1)..];
+        if (tail.Length == 0 || !relative.EndsWith(tail, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string root = relative[..^tail.Length].TrimEnd('/');
+        return root.EndsWith("Content", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Expand a mount path (<c>/Game/X</c>, <c>/Engine/X</c>, <c>/MarvelGAS/X</c>) into the
+    /// VFS path the cooked game uses for it. Every mount ends at a Content folder on disk;
+    /// a mount name says which mount, never where that mount lives, so it has to be placed
+    /// here. Inverse of FZenPackageContext.ConvertFilePathToPackagePath.
+    ///
+    /// Plugins are assumed to sit directly under <c>Marvel/Plugins/&lt;Name&gt;/Content</c>,
+    /// which is where Marvel Rivals keeps its own. A plugin nested in a category folder
+    /// (<c>Engine/Plugins/FX/Niagara/Content</c>) cannot be placed from its name alone, so
+    /// those still rely on the caller passing the assets in their real directory layout,
+    /// which overrides this result.
+    /// </summary>
+    internal static string MountPathToVfsPath(string mountPath)
+    {
+        if (string.IsNullOrEmpty(mountPath) || mountPath[0] != '/')
+            return mountPath?.TrimStart('/') ?? string.Empty;
+
+        int secondSlash = mountPath.IndexOf('/', 1);
+        if (secondSlash < 0)
+            return mountPath.TrimStart('/');
+
+        string mount = mountPath[1..secondSlash];
+        string tail = mountPath[(secondSlash + 1)..];
+        if (mount.Length == 0 || tail.Length == 0)
+            return mountPath.TrimStart('/');
+
+        if (mount.Equals("Game", StringComparison.OrdinalIgnoreCase))
+            return "Marvel/Content/" + tail;
+
+        if (mount.Equals("Engine", StringComparison.OrdinalIgnoreCase))
+            return "Engine/Content/" + tail;
+
+        return "Marvel/Plugins/" + mount + "/Content/" + tail;
+    }
+
     /// <summary>
     /// Normalize a path by resolving .. segments
     /// Example: /Game/Marvel/../../../Marvel/Content/Marvel/Characters -> /Marvel/Content/Marvel/Characters
