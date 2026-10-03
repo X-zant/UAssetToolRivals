@@ -976,6 +976,9 @@ namespace UAssetAPI
                     case "MetaData":
                         Exports[i] = Exports[i].ConvertToChildExport<MetaDataExport>();
                         break;
+                    case "AkAudioEvent":
+                        Exports[i] = Exports[i].ConvertToChildExport<AkAudioEventExport>();
+                        break;
                     default:
                         if (exportClassType.EndsWith("DataTable"))
                         {

@@ -13,6 +13,7 @@ A CLI tool for parsing, editing, and converting Unreal Engine 5 assets. Built on
 - **NiagaraSystem Editing** - Modify particle effect colors with structured ShaderLUT and ArrayColor parsing
 - **MaterialTag Injection** - Auto-inject per-slot gameplay tags from `MaterialTagAssetUserData` during mod creation
 - **StaticMesh Support** - ScreenSize expansion, unversioned property conversion, NavCollision handling
+- **Wwise Event Editing** - `AkAudioEvent` assets read as a typed export: the cooked data (`EventId`, each language's SoundBanks and Media, switch-container leaves) plus the duration fields and Marvel Rivals' extra attenuation/motion fields, editable through the object model and JSON. The parse is kept only when it writes back byte-identical; otherwise the bytes are left untouched
 - **Localization (LocRes) Parsing** - Parse `.locres` files to JSON with namespace/key lookup, search, and stats
 - **Blueprint Analysis** - Scan ChildBP assets for IsEnemy parameter redirects
 - **IoStore Inspection** - List packages and chunk types in IoStore containers
