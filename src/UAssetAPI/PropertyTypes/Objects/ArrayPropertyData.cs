@@ -282,5 +282,17 @@ public class ArrayPropertyData : PropertyData<PropertyData[]>
         ArrayPropertyData cloningProperty = (ArrayPropertyData)res;
         cloningProperty.ArrayType = (FName)this.ArrayType?.Clone();
         cloningProperty.DummyStruct = (StructPropertyData)this.DummyStruct?.Clone();
+
+        // MemberwiseClone copied the reference to this array, so without this the clone and the
+        // original share their elements and editing one silently edits the other.
+        if (this.Value != null)
+        {
+            PropertyData[] newData = new PropertyData[this.Value.Length];
+            for (int i = 0; i < this.Value.Length; i++)
+            {
+                newData[i] = (PropertyData)this.Value[i]?.Clone();
+            }
+            cloningProperty.Value = newData;
+        }
     }
 }
