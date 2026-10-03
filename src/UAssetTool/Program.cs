@@ -667,7 +667,7 @@ public partial class Program
         return best;
     }
 
-    private static int CliCreateModIoStore(string[] args)
+    public static int CliCreateModIoStore(string[] args)
     {
         if (args.Length < 3)
         {
@@ -7051,7 +7051,7 @@ public partial class Program
     /// Converts .uasset/.uexp files to Zen format and creates .utoc/.ucas/.pak bundle.
     /// Supports direct .pak file input (input_pak) as an alternative to input_dir.
     /// </summary>
-    private static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate, bool hybrid = false)
+    public static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate, bool hybrid = false)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
