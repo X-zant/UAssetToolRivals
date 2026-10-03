@@ -85,9 +85,9 @@ public class SetPropertyData : ArrayPropertyData
         if (this.ElementsToRemove != null)
         {
             PropertyData[] newData = new PropertyData[this.ElementsToRemove.Length];
-            for (int i = 0; i < this.Value.Length; i++)
+            for (int i = 0; i < this.ElementsToRemove.Length; i++)
             {
-                newData[i] = (PropertyData)this.Value[i].Clone();
+                newData[i] = (PropertyData)this.ElementsToRemove[i]?.Clone();
             }
             cloningProperty.ElementsToRemove = newData;
         }
