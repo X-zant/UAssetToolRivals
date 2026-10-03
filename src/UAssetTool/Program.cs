@@ -743,6 +743,20 @@ public partial class Program
             {
                 // Already handled by the pre-scan above; consume here so it isn't treated as input.
             }
+            else if (args[i] == "--usmap" && i + 1 < args.Length)
+            {
+                // Zen conversion reads exports as raw bytes and needs no mappings (see
+                // ZenConverter.LoadAsset). The README has always shown --usmap on this command, so
+                // accept it - otherwise the flag and its path fall through to the input handling
+                // below, and with --hybrid the .usmap was packed into the mod as a loose file.
+                i++;
+                Console.Error.WriteLine("[CreateModIoStore] --usmap is not needed for IoStore conversion; ignored");
+            }
+            else if (args[i].StartsWith("--"))
+            {
+                // An option this command does not know is never an input file.
+                Console.Error.WriteLine($"[CreateModIoStore] Unknown option '{args[i]}' ignored");
+            }
             else if (args[i].EndsWith(".pak", StringComparison.OrdinalIgnoreCase) && File.Exists(args[i]))
             {
                 // Extract legacy assets from .pak file to temp directory
