@@ -132,7 +132,7 @@ UAssetTool create_mod_iostore "output/MyMod" --hybrid "my_mixed_mod.pak"
 ```
 
 **Options:**
-- `--usmap <path>` - Path to `.usmap` mappings file (needed for StaticMesh unversioned conversion)
+- `--usmap <path>` - Accepted and ignored: IoStore conversion reads exports as raw bytes and needs no mappings. Any other unknown `--option` is ignored too, and never treated as an input file
 - `--mount-point <path>` - Mount point (default: `../../../`)
 - `--game-path <prefix>` - Game path prefix (default: `Marvel/Content/`)
 - `--compress` / `--no-compress` - Toggle Oodle compression (default: enabled)
