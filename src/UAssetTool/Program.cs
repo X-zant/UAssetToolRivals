@@ -609,6 +609,8 @@ public partial class Program
                 string packageName = relPath;
                 if (packageName.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
                     packageName = packageName[..^7];
+                else if (packageName.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+                    packageName = packageName[..^5];
                 else if (packageName.EndsWith(".uexp", StringComparison.OrdinalIgnoreCase))
                     packageName = packageName[..^5];
 
@@ -788,9 +790,12 @@ public partial class Program
                     }
                     Console.Error.WriteLine($"[CreateModIoStore]   Extracted {extracted} files from PAK");
 
-                    // Find all .uasset files in the extracted directory
+                    // Find all package files in the extracted directory. Maps are .umap, not .uasset;
+                    // globbing only *.uasset silently drops every level package (the map never reaches the
+                    // Zen converter and the container ships with no map). Include both extensions.
                     inputRoots.Add(Path.GetFullPath(tempDir));
-                    var dirFiles = Directory.GetFiles(tempDir, "*.uasset", SearchOption.AllDirectories);
+                    var dirFiles = Directory.GetFiles(tempDir, "*.uasset", SearchOption.AllDirectories)
+                        .Concat(Directory.GetFiles(tempDir, "*.umap", SearchOption.AllDirectories)).ToArray();
                     foreach (var f in dirFiles)
                     {
                         uassetFiles.Add(Path.GetFullPath(f));
@@ -822,8 +827,12 @@ public partial class Program
                     Console.Error.WriteLine($"Error extracting PAK: {ex.Message}");
                 }
             }
-            else if (args[i].EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) && File.Exists(args[i]))
+            else if ((args[i].EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)
+                      || args[i].EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+                     && File.Exists(args[i]))
             {
+                // A level package is a .umap; without this it fell through to the stray-file
+                // branch below and was skipped as "non-.uasset".
                 uassetFiles.Add(Path.GetFullPath(args[i]));
             }
             else if (args[i].EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase) && File.Exists(args[i]))
@@ -832,9 +841,10 @@ public partial class Program
             }
             else if (Directory.Exists(args[i]))
             {
-                // Support directory input - recursively find all .uasset files
+                // Support directory input - recursively find all package files (.uasset AND .umap maps).
                 inputRoots.Add(Path.GetFullPath(args[i]));
-                var dirFiles = Directory.GetFiles(args[i], "*.uasset", SearchOption.AllDirectories);
+                var dirFiles = Directory.GetFiles(args[i], "*.uasset", SearchOption.AllDirectories)
+                    .Concat(Directory.GetFiles(args[i], "*.umap", SearchOption.AllDirectories)).ToArray();
                 foreach (var f in dirFiles)
                 {
                     uassetFiles.Add(Path.GetFullPath(f));
@@ -1001,11 +1011,14 @@ public partial class Program
                         storeEntry.ImportedPackages.Add(new IoStore.FPackageId(importedPkgId));
                     }
 
-                    // Write to IoStore
-                    string fullPath = mountPoint + packagePath + ".uasset";
+                    // Write to IoStore. Preserve the package extension: a level package is .umap, not .uasset.
+                    // The chunk id is package-id based (extension-independent), but the directory index must keep
+                    // the real extension so the map is listed and resolved as a .umap.
+                    string pkgExt = uassetPath.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? ".umap" : ".uasset";
+                    string fullPath = mountPoint + packagePath + pkgExt;
                     ioStoreWriter.WritePackageChunk(chunkId, fullPath, zenData, storeEntry);
 
-                    filePaths.Add(packagePath + ".uasset");
+                    filePaths.Add(packagePath + pkgExt);
                     filePaths.Add(packagePath + ".uexp");
 
                     // Handle .ubulk if exists (already loaded during parallel phase)
@@ -7092,11 +7105,7 @@ public partial class Program
                     {
                         // Skip non-asset files — UNLESS hybrid mode is on, in which case we extract
                         // everything so non-Unreal files can be embedded into the companion PAK.
-                        if (!hybrid &&
-                            !file.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
-                            !file.EndsWith(".uexp", StringComparison.OrdinalIgnoreCase) &&
-                            !file.EndsWith(".ubulk", StringComparison.OrdinalIgnoreCase) &&
-                            !file.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase))
+                        if (!hybrid && !IsUnrealFamilyFile(file))
                             continue;
 
                         byte[] data = pakReader.Get(file);
@@ -7137,8 +7146,9 @@ public partial class Program
         
         try
         {
-            // Collect all uasset files
-            var uassetFiles = Directory.GetFiles(effectiveInputDir, "*.uasset", SearchOption.AllDirectories).ToList();
+            // Collect all package files (.uasset AND .umap maps; a *.uasset-only glob drops every level).
+            var uassetFiles = Directory.GetFiles(effectiveInputDir, "*.uasset", SearchOption.AllDirectories)
+                .Concat(Directory.GetFiles(effectiveInputDir, "*.umap", SearchOption.AllDirectories)).ToList();
             var inputRoots = new List<string> { Path.GetFullPath(effectiveInputDir) };
 
             // Collect shader bytecode files
@@ -7276,12 +7286,13 @@ public partial class Program
                         storeEntry.ImportedPackages.Add(new IoStore.FPackageId(importedPkgId));
                     }
                     
-                    // Write to IoStore
-                    string fullPath = mount + packagePath + ".uasset";
+                    // Write to IoStore. Preserve the package extension: a level package is .umap, not .uasset.
+                    string pkgExt = uassetPath.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? ".umap" : ".uasset";
+                    string fullPath = mount + packagePath + pkgExt;
                     ioStoreWriter.WritePackageChunk(chunkId, fullPath, zenData, storeEntry);
                     
                     // Add to chunknames
-                    filePaths.Add(packagePath + ".uasset");
+                    filePaths.Add(packagePath + pkgExt);
                     filePaths.Add(packagePath + ".uexp");
                     
                     // Handle .ubulk if exists (already loaded during parallel phase)
