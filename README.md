@@ -12,6 +12,7 @@ A CLI tool for parsing, editing, and converting Unreal Engine 5 assets. Built on
 - **Texture Extraction** - Extract Texture2D assets to PNG/TGA/DDS/BMP with parallel batch support; handles inline (no `.ubulk`), external, and OptionalBulkData mips
 - **NiagaraSystem Editing** - Modify particle effect colors with structured ShaderLUT and ArrayColor parsing
 - **MaterialTag Injection** - Auto-inject per-slot gameplay tags from `MaterialTagAssetUserData` during mod creation
+- **MaterialTag Preset Export** - Scan the game's own SkeletalMeshes straight out of the `.utoc`/`.ucas` and write a `MaterialTagPresets.ini` of per-slot tags and per-LOD `DefaultHiddenMaterials` for the UE editor plugin
 - **StaticMesh Support** - ScreenSize expansion, unversioned property conversion, NavCollision handling
 - **Wwise Event Editing** - `AkAudioEvent` assets read as a typed export: the cooked data (`EventId`, each language's SoundBanks and Media, switch-container leaves) plus the duration fields and Marvel Rivals' extra attenuation/motion fields, editable through the object model and JSON. The parse is kept only when it writes back byte-identical; otherwise the bytes are left untouched
 - **Localization (LocRes) Parsing** - Parse `.locres` files to JSON with namespace/key lookup, search, and stats
@@ -463,6 +464,111 @@ Shows each package and its chunk types (ExportBundleData, BulkData, OptionalBulk
 
 ---
 
+## MaterialTag Preset Export
+
+Read the gameplay tags and hidden-material flags the **game itself** ships on every
+SkeletalMesh, and write them as a `MaterialTagPresets.ini` for the MaterialTagPlugin in the
+UE editor. Nothing is extracted to disk: packages are read straight out of the
+`.utoc`/`.ucas` containers.
+
+This ships as its **own executable**, `MaterialTagPresetExporter`, built from
+`src/MaterialTagPresetExporter/`:
+
+```bash
+MaterialTagPresetExporter <paks_directory> <output.ini> --usmap <path> [options]
+
+# Every character mesh in the game (the default scope)
+MaterialTagPresetExporter "F:/MarvelRivals/MarvelGame/Marvel/Content/Paks" MaterialTagPresets.ini --usmap game.usmap
+
+# One hero
+MaterialTagPresetExporter "C:/Game/Paks" hero1014.ini --usmap game.usmap --filter Characters/1014/
+```
+
+Publish it as a single self-contained executable that needs nothing else installed, not even
+the .NET runtime:
+
+```bash
+dotnet publish src/MaterialTagPresetExporter/MaterialTagPresetExporter.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+```
+
+That produces one ~70 MB `MaterialTagPresetExporter.exe`. Drop it anywhere and run it. Game
+containers are Oodle-compressed, so on first run it fetches `oo2core_9_win64.dll` (about
+600 KB) next to itself; on a machine without internet access, copy that DLL in beside the
+executable yourself.
+
+For development, `dotnet build src/MaterialTagPresetExporter/MaterialTagPresetExporter.csproj -c Release`
+produces a framework-dependent build that needs the .NET 8 runtime and the sibling DLLs.
+
+The same exporter is also reachable from UAssetTool as `export_material_tag_presets` (identical
+options) and over the JSON API as the `export_material_tag_presets` action, so Repak-X can call
+it without shelling out:
+
+```bash
+UAssetTool export_material_tag_presets <paks_directory> <output.ini> --usmap <path> [options]
+```
+
+`--usmap` is required: `DefaultHiddenMaterials` lives in unversioned properties.
+
+**Options:**
+- `--path <vfs_prefix>` - Restrict the scan to a VFS path (default: `Marvel/Content/Marvel/Characters/`)
+- `--all-paths` - Scan the whole game instead of the Characters directory
+- `--filter <patterns...>` - Only meshes whose path contains one of the patterns
+- `--prefix <prefixes...>` - Package name prefixes to consider (default: `SK_`)
+- `--all` - Consider every package name and detect SkeletalMeshes by class
+- `--include-untagged` - Also write meshes where no slot carries a tag (omitted by default)
+- `--bare-slot-names` - Drop the FName number suffix from slot names (`MI_Fire_4` rather than `MI_Fire_4_112`)
+- `--no-path-comment` - Omit the `; /Game/...` line under each section header
+- `--legacy-format` - Shorthand for both of the above, matching the shape of the original hand-made preset INI
+- `--threads <n>` / `--batch <n>` / `--mesh-prefix-kb <n>` - Throughput vs memory (see below)
+- `--verbose` - Log every package, with per-package allocation and per-batch heap
+- `--full-read` - Decompress whole package chunks instead of the mesh prefix (diagnostics)
+- `--aes <hex>` - AES key (defaults to the Marvel Rivals key)
+
+**Output format** (UTF-8, CRLF):
+```ini
+[SK_1014_1014001]
+; /Game/Marvel/Characters/1014/1014001/Meshes/SK_1014_1014001
+SlotCount=14
+Slot_0=MI_1014001_GatlingGun_Weapon_01|MaterialTag.装备.武器
+Slot_2=MI_1014001_Head|
+MaterialTag.装备.武器=MI_1014001_GatlingGun_Weapon_01
+LOD_0_Hidden=0,0,0,0,0,0,0,0,0,0,0,0,0,1
+LODCount=1
+```
+With `--legacy-format` the path comment is dropped and slot names lose their FName suffix,
+which is the exact shape of the original preset file:
+
+```ini
+[SK_1014_1014001]
+SlotCount=14
+Slot_0=MI_1014001_GatlingGun_Weapon_01|MaterialTag.装备.武器
+MaterialTag.装备.武器=MI_1014001_GatlingGun_Weapon_01
+LOD_0_Hidden=0,0,0,0,0,0,0,0,0,0,0,0,0,1
+LODCount=1
+```
+
+Sections are ordered by package path, which need not match an older file's order; lookups go
+by section name, so order carries no meaning.
+
+`Slot_N` lines keep asset order; the tag index lines that follow are sorted, listing the
+slots each tag applies to. `LOD_N_Hidden` carries one `0`/`1` per entry of that LOD's
+`DefaultHiddenMaterials` array, and only LODs that actually carry the property are written.
+
+**Where the data comes from:** slot names and tags are read from the `FGameplayTagContainer`
+that Marvel Rivals appends to each `FSkeletalMaterial` in the mesh export's binary extras;
+hidden flags come from the `DefaultHiddenMaterials` array inside each `LODInfo` struct. Both
+are the cooked, shipping values, not an editor-side `MaterialTagAssetUserData` carrier.
+
+**Cost:** only the front of each mesh export is decompressed (1 MB by default) rather than
+whole packages, and the container cache is evicted every batch. Scanning the ~8,000 `SK_*`
+packages under `Marvel/Content/Marvel/Characters/` takes about 50 seconds and peaks under
+3 GB, most of which is the one-time container indexing every command pays.
+
+Meshes whose material list cannot be located in the cooked extras are counted and skipped
+rather than written out with wrong slot names; `--verbose` lists them.
+
+---
+
 ## Other Commands
 
 ```bash
@@ -630,6 +736,7 @@ UassetToolRivals/
     │   │   ├── PakReader.cs
     │   │   ├── PakWriter.cs
     │   │   └── OodleCompression.cs
+    │   ├── MaterialTagPresets.cs    # MaterialTagPresets.ini export from game containers
     │   ├── Texture/             # Texture injection & extraction
     │   │   ├── TextureInjector.cs   # PNG/TGA/DDS → uasset (BC1-BC7)
     │   │   └── TextureExtractor.cs  # uasset → PNG/TGA/DDS/BMP
@@ -638,7 +745,9 @@ UassetToolRivals/
     │       ├── ZenToLegacyConverter.cs  # Zen → Legacy extraction
     │       ├── FZenPackageContext.cs    # Multi-container IoStore context
     │       ├── MaterialTagReader.cs     # MaterialTag auto-injection
+    │       ├── HiddenMaterialsReader.cs # DefaultHiddenMaterials read/inject
     │       └── ScriptObjectsDatabase.cs # Engine class hash resolution
+    ├── MaterialTagPresetExporter/   # Standalone MaterialTagPresets.ini generator (own exe)
     └── UAssetAPI/               # Core UAsset parsing (modified fork)
         ├── Localization/        # FTextLocalizationResource (.locres parser)
         └── ExportTypes/
