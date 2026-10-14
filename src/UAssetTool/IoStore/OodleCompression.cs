@@ -49,13 +49,15 @@ public enum OodleCompressionLevel : int
 public static class OodleCompression
 {
     private const string OODLE_DLL_NAME = "oo2core_9_win64"; // logical name, resolved per-platform
-    private const string OODLE_DOWNLOAD_URL = "https://github.com/new-world-tools/go-oodle/releases/download/v0.2.3-files/oo2core_9_win64.dll";
+    private const string OODLE_DOWNLOAD_BASE_URL = "https://github.com/new-world-tools/go-oodle/releases/download/v0.2.3-files/";
     private const long OODLE_MIN_VALID_SIZE = 500_000; // 500KB minimum
 
     private static volatile bool _initialized = false;
     private static volatile bool _available = false;
     private static bool _resolverRegistered = false;
     private static readonly object _initLock = new object();
+    // Where the validated library was found or downloaded to; the resolver loads from here.
+    private static string? _libraryPath;
 
     /// <summary>
     /// Get the platform-specific Oodle library filename.
@@ -72,6 +74,30 @@ public static class OodleCompression
     }
 
     /// <summary>
+    /// Get the download URL for this platform's Oodle library, or null if none is hosted.
+    /// </summary>
+    private static string? GetDownloadUrl()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            return OODLE_DOWNLOAD_BASE_URL + GetPlatformLibraryName();
+        return null;
+    }
+
+    /// <summary>
+    /// Directories searched for the Oodle library, in order. Beside the executable first; the
+    /// per-user data directory is the fallback for installs where that location is read-only
+    /// (AppImage, /usr/bin).
+    /// </summary>
+    private static IEnumerable<string> GetLibraryDirectories()
+    {
+        yield return AppContext.BaseDirectory;
+
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrEmpty(localAppData))
+            yield return Path.Combine(localAppData, "UAssetTool");
+    }
+
+    /// <summary>
     /// Register a DllImport resolver so the runtime finds the correct platform library.
     /// </summary>
     private static void RegisterResolver()
@@ -84,9 +110,8 @@ public static class OodleCompression
             if (libraryName == OODLE_DLL_NAME || libraryName == "oo2core_9_win64.dll")
             {
                 string platformLib = GetPlatformLibraryName();
-                // Try beside the executable first
-                string exePath = AppContext.BaseDirectory;
-                string fullPath = Path.Combine(exePath, platformLib);
+                // Try the location Initialize settled on, else beside the executable
+                string fullPath = _libraryPath ?? Path.Combine(AppContext.BaseDirectory, platformLib);
                 if (NativeLibrary.TryLoad(fullPath, out IntPtr handle))
                     return handle;
                 // Try system paths
@@ -146,7 +171,7 @@ public static class OodleCompression
     }
 
     /// <summary>
-    /// Initialize Oodle - download library if needed (Windows only).
+    /// Initialize Oodle - download library if needed (Windows and Linux).
     /// </summary>
     public static void Initialize()
     {
@@ -168,18 +193,20 @@ public static class OodleCompression
             {
                 RegisterResolver();
 
-                string exePath = AppContext.BaseDirectory;
                 string libName = GetPlatformLibraryName();
-                string libPath = Path.Combine(exePath, libName);
 
                 // Check if library exists and is valid
-                if (!IsOodleValid(libPath))
+                string? libPath = GetLibraryDirectories()
+                    .Select(dir => Path.Combine(dir, libName))
+                    .FirstOrDefault(IsOodleValid);
+
+                if (libPath == null)
                 {
-                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    string? downloadUrl = GetDownloadUrl();
+                    if (downloadUrl != null)
                     {
-                        // Auto-download only on Windows
                         Console.Error.WriteLine($"[Oodle] Downloading Oodle library...");
-                        DownloadOodle(libPath);
+                        libPath = DownloadOodle(downloadUrl, libName);
                     }
                     else
                     {
@@ -190,8 +217,10 @@ public static class OodleCompression
                 }
 
                 // Try to load and test
-                if (File.Exists(libPath))
+                if (libPath != null)
                 {
+                    _libraryPath = libPath;
+
                     // Test by calling GetCompressedBufferSizeNeeded
                     var size = OodleLZ_GetCompressedBufferSizeNeeded(OodleCompressor.Kraken, (IntPtr)1024);
                     if (size.ToInt64() > 0)
@@ -236,14 +265,18 @@ public static class OodleCompression
         return true;
     }
 
-    private static void DownloadOodle(string targetPath)
+    /// <summary>
+    /// Download the Oodle library into the first writable library directory.
+    /// Returns the path it was written to, or null on failure.
+    /// </summary>
+    private static string? DownloadOodle(string url, string libName)
     {
         try
         {
             using var client = new HttpClient();
             client.Timeout = TimeSpan.FromMinutes(2);
             
-            var response = client.GetAsync(OODLE_DOWNLOAD_URL).Result;
+            var response = client.GetAsync(url).Result;
             response.EnsureSuccessStatusCode();
             
             var bytes = response.Content.ReadAsByteArrayAsync().Result;
@@ -251,13 +284,28 @@ public static class OodleCompression
             if (bytes.Length < OODLE_MIN_VALID_SIZE)
                 throw new Exception($"Downloaded file is too small ({bytes.Length} bytes)");
 
-            File.WriteAllBytes(targetPath, bytes);
-            Console.Error.WriteLine($"[Oodle] Downloaded successfully ({bytes.Length} bytes)");
+            foreach (string dir in GetLibraryDirectories())
+            {
+                string targetPath = Path.Combine(dir, libName);
+                try
+                {
+                    Directory.CreateDirectory(dir);
+                    File.WriteAllBytes(targetPath, bytes);
+                    Console.Error.WriteLine($"[Oodle] Downloaded successfully ({bytes.Length} bytes) to {targetPath}");
+                    return targetPath;
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+                {
+                    Console.Error.WriteLine($"[Oodle] Cannot write to {dir}: {ex.Message}");
+                }
+            }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Oodle] Download failed: {ex.Message}");
         }
+
+        return null;
     }
 
     /// <summary>

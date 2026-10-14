@@ -6713,7 +6713,7 @@ public partial class Program
             {
                 string? fullPath = context.GetPackagePath(packageId);
                 var cached = context.GetCachedPackage(packageId);
-                if (cached == null) continue;
+                if (cached == null) { failed++; continue; }
                 
                 string packageName = !string.IsNullOrEmpty(fullPath) ? fullPath : cached.Header.PackageName();
                 
@@ -6913,7 +6913,13 @@ public partial class Program
 
                 string? fullPath = context.GetPackagePath(packageId);
                 var cached = context.GetCachedPackage(packageId);
-                if (cached == null) return imports;
+                if (cached == null)
+                {
+                    // A requested package is listed in a container, so failing to load it is a
+                    // real failure (e.g. Oodle unavailable). A dependency may simply not exist.
+                    if (!isDependency) failed++;
+                    return imports;
+                }
 
                 string packageName = !string.IsNullOrEmpty(fullPath) ? fullPath : cached.Header.PackageName();
 
@@ -6993,6 +6999,12 @@ public partial class Program
                             if (!extractedPackages.Contains(importId))
                                 pendingDependencies.Add(importId);
                 }
+            }
+
+            if (converted == 0 && failed > 0)
+            {
+                string reason = IoStore.OodleCompression.IsAvailable ? "" : " (Oodle library unavailable)";
+                return new UAssetResponse { Success = false, Message = $"Failed to extract IoStore (legacy): all {failed} packages failed{reason}" };
             }
 
             return new UAssetResponse
