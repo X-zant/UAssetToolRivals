@@ -177,6 +177,7 @@ namespace UAssetAPI.ExportTypes
         {
             // Read RefBoneInfo array
             int boneInfoCount = reader.ReadInt32();
+            ValidateCount(reader, boneInfoCount, FMeshBoneInfo.SerializedSize, nameof(RefBoneInfo));
             RefBoneInfo = new List<FMeshBoneInfo>(boneInfoCount);
             for (int i = 0; i < boneInfoCount; i++)
             {
@@ -185,6 +186,7 @@ namespace UAssetAPI.ExportTypes
 
             // Read RefBonePose array
             int bonePoseCount = reader.ReadInt32();
+            ValidateCount(reader, bonePoseCount, MinTransformSize, nameof(RefBonePose));
             RefBonePose = new List<FTransform>(bonePoseCount);
             for (int i = 0; i < bonePoseCount; i++)
             {
@@ -193,6 +195,7 @@ namespace UAssetAPI.ExportTypes
 
             // Read NameToIndexMap (TMap<FName, int32>)
             int mapCount = reader.ReadInt32();
+            ValidateCount(reader, mapCount, 12, nameof(NameToIndexMap)); // FName(8) + int32(4)
             NameToIndexMap = new Dictionary<FName, int>(mapCount);
             for (int i = 0; i < mapCount; i++)
             {
@@ -233,6 +236,29 @@ namespace UAssetAPI.ExportTypes
         /// <summary>
         /// Get the number of bones in the skeleton.
         /// </summary>
+        /// <summary>
+        /// FQuat + 2x FVector at single precision: the smallest an FTransform can serialize to.
+        /// </summary>
+        private const int MinTransformSize = 40;
+
+        /// <summary>
+        /// Reject an element count that cannot possibly fit in the bytes that are left before
+        /// allocating for it. Callers of this constructor probe speculative offsets (see
+        /// SkeletalMeshExport.TryParseExtraData), so a garbage count is an expected outcome —
+        /// and sizing a list or dictionary from one used to commit gigabytes of capacity per
+        /// probe before the read failed anyway.
+        /// </summary>
+        private static void ValidateCount(AssetBinaryReader reader, int count, int minElementSize, string fieldName)
+        {
+            if (count < 0)
+                throw new FormatException($"FReferenceSkeleton.{fieldName}: negative count {count}");
+
+            long remaining = reader.BaseStream.Length - reader.BaseStream.Position;
+            if ((long)count * minElementSize > remaining)
+                throw new FormatException(
+                    $"FReferenceSkeleton.{fieldName}: count {count} needs at least {(long)count * minElementSize} bytes, only {remaining} remain");
+        }
+
         public int BoneCount => RefBoneInfo.Count;
 
         /// <summary>

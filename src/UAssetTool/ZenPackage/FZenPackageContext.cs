@@ -450,6 +450,29 @@ public class FZenPackageContext : IDisposable
     }
 
     /// <summary>
+    /// Uncompressed size of a package's export-bundle chunk, or -1 when unknown.
+    /// </summary>
+    public long GetPackageChunkSize(ulong packageId)
+    {
+        if (!_packageIdToChunk.TryGetValue(packageId, out var location))
+            return -1;
+        return _containers[location.ContainerIndex].GetChunkSize(location.ChunkId);
+    }
+
+    /// <summary>
+    /// Read only the first <paramref name="maxBytes"/> of a package's export-bundle chunk,
+    /// decompressing just the blocks that cover them. Nothing is cached: callers that only
+    /// need the zen header (or the head of one export) use this to avoid pulling a whole
+    /// multi-megabyte mesh or texture through memory. Returns null if the package is unknown.
+    /// </summary>
+    public byte[]? ReadPackagePrefix(ulong packageId, int maxBytes)
+    {
+        if (!_packageIdToChunk.TryGetValue(packageId, out var location))
+            return null;
+        return _containers[location.ContainerIndex].ReadChunkPrefix(location.ChunkId, maxBytes);
+    }
+
+    /// <summary>
     /// Get cached package with raw data
     /// </summary>
     public CachedPackage? GetCachedPackage(ulong packageId)

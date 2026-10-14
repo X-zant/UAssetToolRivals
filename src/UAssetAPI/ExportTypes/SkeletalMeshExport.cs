@@ -279,10 +279,17 @@ namespace UAssetAPI.ExportTypes
             // Try both material sizes: 40 (legacy) and 44 (with empty FGameplayTagContainer)
             int[] materialSizes = { 40, 44 };
             
+            // One stream and reader for the whole scan. This used to be constructed per
+            // candidate offset, which turned a scan over a megabyte of non-matching bytes
+            // into gigabytes of short-lived garbage (a reader, a stream, a list and up to
+            // MAX_MATERIAL_COUNT materials per offset). Seeking is equivalent and free.
+            using var scanStream = new MemoryStream(Extras, writable: false);
+            using var scanReader = new AssetBinaryReader(scanStream, Asset);
+
             foreach (int materialStructSize in materialSizes)
             {
                 bool includeGameplayTags = (materialStructSize == 44);
-                
+
                 // Search through the extra data for a valid material array pattern
                 for (int i = 4; i < Extras.Length - (materialStructSize * 2); i++)
                 {
@@ -299,8 +306,7 @@ namespace UAssetAPI.ExportTypes
                     // Validate the pattern by checking multiple materials with this size
                     bool validPattern = true;
                     int validatedCount = 0;
-                    int nameMapCount = Asset?.GetNameMapIndexList()?.Count ?? int.MaxValue;
-                    
+
                     for (int m = 0; m < Math.Min(potentialCount, 5); m++)
                     {
                         int matOffset = i + 4 + (m * materialStructSize);
@@ -340,22 +346,24 @@ namespace UAssetAPI.ExportTypes
                     _materialsOffset = i;
                     int materialCount = potentialCount;
                     
-                    Materials = new List<FSkeletalMaterial>();
-                    using var ms = new MemoryStream(Extras, i + 4, Extras.Length - i - 4);
-                    using var matReader = new AssetBinaryReader(ms, Asset);
-                    
+                    // Parse into a local list and only publish it on success, so a failed
+                    // candidate leaves no half-filled Materials behind.
+                    var parsed = new List<FSkeletalMaterial>(materialCount);
+                    scanStream.Position = i + 4;
+
                     try
                     {
                         for (int m = 0; m < materialCount; m++)
                         {
                             var mat = new FSkeletalMaterial();
-                            mat.Read(matReader, includeGameplayTags: includeGameplayTags);
-                            Materials.Add(mat);
+                            mat.Read(scanReader, includeGameplayTags: includeGameplayTags);
+                            parsed.Add(mat);
                         }
-                        
+
+                        Materials = parsed;
                         _originalMaterialsByteLength = 4 + (materialCount * materialStructSize);
                         _sourceHadGameplayTags = includeGameplayTags;
-                        
+
                         // Successfully parsed materials
                         return;
                     }
