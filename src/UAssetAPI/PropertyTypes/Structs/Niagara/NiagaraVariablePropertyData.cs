@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using System;
 using UAssetAPI.PropertyTypes.Objects;
 using UAssetAPI.UnrealTypes;
 
@@ -6,7 +7,9 @@ namespace UAssetAPI.PropertyTypes.Structs;
 
 public class NiagaraVariableBasePropertyData : StructPropertyData
 {
+    [JsonProperty]
     public FName VariableName;
+    [JsonProperty]
     public StructPropertyData TypeDef;
 
     public NiagaraVariableBasePropertyData(FName name, FName forcedType) : base(name, forcedType) { }
@@ -54,6 +57,7 @@ public class NiagaraVariableBasePropertyData : StructPropertyData
 
 public class NiagaraVariablePropertyData : NiagaraVariableBasePropertyData
 {
+    [JsonProperty]
     public byte[] VarData;
 
     public NiagaraVariablePropertyData(FName name, FName forcedType) : base(name, forcedType) { }
@@ -96,6 +100,7 @@ public class NiagaraVariablePropertyData : NiagaraVariableBasePropertyData
 
 public class NiagaraVariableWithOffsetPropertyData : NiagaraVariableBasePropertyData
 {
+    [JsonProperty]
     public int VariableOffset;
 
     public NiagaraVariableWithOffsetPropertyData(FName name, FName forcedType) : base(name, forcedType) { }

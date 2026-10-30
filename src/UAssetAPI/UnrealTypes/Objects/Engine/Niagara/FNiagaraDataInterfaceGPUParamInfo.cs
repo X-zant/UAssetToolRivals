@@ -15,6 +15,17 @@ public class FNiagaraDataInterfaceGeneratedFunction
     /** Specifier values for this instance. */
     public (FName, FName)[] Specifiers;
 
+    /** Name and underlying type of each variadic input. */
+    public (FName, FPackageIndex)[] VariadicInputs = [];
+
+    /** Name and underlying type of each variadic output. */
+    public (FName, FPackageIndex)[] VariadicOutputs = [];
+
+    public FNiagaraDataInterfaceGeneratedFunction()
+    {
+
+    }
+
     public FNiagaraDataInterfaceGeneratedFunction(AssetBinaryReader reader)
     {
         DefinitionName = reader.ReadFName();
@@ -26,6 +37,22 @@ public class FNiagaraDataInterfaceGeneratedFunction
         {
             Specifiers[i] = (reader.ReadFName(), reader.ReadFName());
         }
+
+        if (reader.Asset.GetCustomVersion<FNiagaraCustomVersion>() >= FNiagaraCustomVersion.AddVariadicParametersToGPUFunctionInfo)
+        {
+            VariadicInputs = ReadVariables(reader);
+            VariadicOutputs = ReadVariables(reader);
+        }
+    }
+
+    private static (FName, FPackageIndex)[] ReadVariables(AssetBinaryReader reader)
+    {
+        var variables = new (FName, FPackageIndex)[reader.ReadInt32()];
+        for (int i = 0; i < variables.Length; i++)
+        {
+            variables[i] = (reader.ReadFName(), new FPackageIndex(reader));
+        }
+        return variables;
     }
 
     public void Write(AssetBinaryWriter writer)
@@ -38,6 +65,22 @@ public class FNiagaraDataInterfaceGeneratedFunction
         {
             writer.Write(spec.Item1);
             writer.Write(spec.Item2);
+        }
+
+        if (writer.Asset.GetCustomVersion<FNiagaraCustomVersion>() >= FNiagaraCustomVersion.AddVariadicParametersToGPUFunctionInfo)
+        {
+            WriteVariables(writer, VariadicInputs);
+            WriteVariables(writer, VariadicOutputs);
+        }
+    }
+
+    private static void WriteVariables(AssetBinaryWriter writer, (FName, FPackageIndex)[] variables)
+    {
+        writer.Write(variables.Length);
+        foreach (var variable in variables)
+        {
+            writer.Write(variable.Item1);
+            variable.Item2.Write(writer);
         }
     }
 }
