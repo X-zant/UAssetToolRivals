@@ -134,6 +134,9 @@ namespace UAssetAPI.UnrealTypes
                     {
                         if (int.TryParse(endSegment, out int endSegmentVal))
                         {
+                            // the name map can hold the whole string (package paths, Python classes), which is then not a base name and a number
+                            if (asset != null && !asset.ContainsNameReference(FString.FromString(startSegment)) && asset.ContainsNameReference(FString.FromString(val))) return;
+
                             str = startSegment;
                             num = endSegmentVal + 1;
                             return;

@@ -1048,6 +1048,11 @@ namespace UAssetAPI
                         if (newSchema != null)
                         {
                             newSchema.ModulePath = InternalAssetPath;
+                            // a class can share its name with its parent, so keep the parent reachable by path before replacing it
+                            if (newSchema.SuperType == newSchema.Name && newSchema.SuperTypeModulePath != null && Mappings.Schemas.TryGetValue(newSchema.Name, out UsmapSchema sameNamedParent))
+                            {
+                                Mappings.Schemas[newSchema.SuperTypeModulePath + "." + newSchema.SuperType] = sameNamedParent;
+                            }
                             Mappings.Schemas[fetchedStructExp.ObjectName.ToString()] = newSchema;
                             if (!string.IsNullOrEmpty(newSchema.ModulePath)) Mappings.Schemas[newSchema.ModulePath + "." + (string.IsNullOrEmpty(outer) ? string.Empty : (outer + ".")) + fetchedStructExp.ObjectName.ToString()] = newSchema;
                         }
