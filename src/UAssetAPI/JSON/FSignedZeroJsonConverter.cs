@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using UAssetAPI.UnrealTypes;
 using UAssetAPI.ExportTypes;
 
@@ -48,7 +49,8 @@ namespace UAssetAPI.JSON
                 if (reader.Value.Equals("-0")) return Convert.ChangeType(negativeZero, objectType);
             }
 
-            object res = Convert.ChangeType(reader.Value, objectType);
+            // infinities reach here as strings, and the current culture may spell them differently
+            object res = Convert.ChangeType(reader.Value, objectType, CultureInfo.InvariantCulture);
             if (res is null) return 0;
             return res;
         }

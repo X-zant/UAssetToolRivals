@@ -711,14 +711,34 @@ namespace UAssetAPI.Unversioned
         public IList<UsmapProperty> GetAllProperties(string schemaName, string modulePath = null, UAsset asset = null)
         {
             List<UsmapProperty> res = new List<UsmapProperty>();
-            UsmapSchema relevantSchema = this.GetSchemaFromName(schemaName, asset, modulePath);
-            while (schemaName != null && relevantSchema != null)
+            foreach (UsmapSchema schema in this.GetHierarchy(this.GetSchemaFromName(schemaName, asset, modulePath), asset))
             {
-                res.AddRange(relevantSchema.Properties.Values);
-                schemaName = relevantSchema.SuperType;
-                relevantSchema = this.GetSchemaFromName(schemaName, asset);
+                res.AddRange(schema.Properties.Values);
             }
             return res;
+        }
+
+        /// <summary>
+        /// Retrieve the schema that a schema inherits from. A class can share its name with its parent, so the name alone may lead back to the class itself.
+        /// </summary>
+        /// <param name="schema">The schema of interest.</param>
+        /// <param name="asset">An asset to also search for schemas within.</param>
+        /// <param name="throwExceptions">Whether or not to throw if the parent cannot be found.</param>
+        /// <returns>The parent schema, or null if there is none.</returns>
+        public UsmapSchema GetSuperSchema(UsmapSchema schema, UAsset asset = null, bool throwExceptions = true)
+        {
+            if (schema.SuperType == null) return null;
+            if (schema.SuperTypeModulePath != null && this.Schemas.TryGetValue(schema.SuperTypeModulePath + "." + schema.SuperType, out UsmapSchema qualified)) return qualified;
+            return schema.Name == schema.SuperType ? null : this.GetSchemaFromName(schema.SuperType, asset, null, throwExceptions);
+        }
+
+        private IEnumerable<UsmapSchema> GetHierarchy(UsmapSchema first, UAsset asset, bool throwExceptions = true)
+        {
+            var seen = new HashSet<UsmapSchema>();
+            for (UsmapSchema schema = first; schema != null && seen.Add(schema); schema = this.GetSuperSchema(schema, asset, throwExceptions))
+            {
+                yield return schema;
+            }
         }
 
         /// <summary>
@@ -735,11 +755,10 @@ namespace UAssetAPI.Unversioned
         {
             List<string> res = new List<string>();
             bool hasDoneFirst = false;
-            UsmapSchema relevantSchema = this.GetSchemaFromName(schemaName, asset);
-            while (schemaName != null && relevantSchema != null)
+            foreach (UsmapSchema relevantSchema in this.GetHierarchy(this.GetSchemaFromName(schemaName, asset), asset))
             {
                 string schemaAnnotation = relevantSchema.FromAsset ? " (blueprint)" : string.Empty;
-                res.Add(headerPrefix + schemaName + schemaAnnotation + headerSuffix);
+                res.Add(headerPrefix + relevantSchema.Name + schemaAnnotation + headerSuffix);
 
                 if (recursive || !hasDoneFirst)
                 {
@@ -754,8 +773,6 @@ namespace UAssetAPI.Unversioned
                     res.Add(string.Empty);
                 }
 
-                schemaName = relevantSchema.SuperType;
-                relevantSchema = this.GetSchemaFromName(schemaName, asset);
                 hasDoneFirst = true;
             }
             return string.Join("\n", res.ToArray());
@@ -819,21 +836,13 @@ namespace UAssetAPI.Unversioned
             var schemaName = ancestry.Parent.Value.Value;
 
             // Collect the hierarchy from derived → base
-            var hierarchy = new List<(UsmapSchema schema, string name)>();
-            var walkName = schemaName;
-            var walkSchema = this.GetSchemaFromName(walkName, asset);
-            while (walkName != null && walkSchema != null)
-            {
-                hierarchy.Add((walkSchema, walkName));
-                walkName = walkSchema.SuperType;
-                walkSchema = this.GetSchemaFromName(walkName, asset);
-            }
+            var hierarchy = this.GetHierarchy(this.GetSchemaFromName(schemaName, asset), asset).ToList();
 
             // Walk from base → derived (reverse order) to compute correct base offsets
             // Base class props get the lowest indices
             for (int i = hierarchy.Count - 1; i >= 0; i--)
             {
-                var (schema, _) = hierarchy[i];
+                var schema = hierarchy[i];
                 propDat = schema.GetProperty(propertyName.Value.Value, dupIndex) as T;
                 if (propDat != null)
                 {
@@ -872,13 +881,17 @@ namespace UAssetAPI.Unversioned
             }
 
             var schemaName = ancestry.Parent?.Value?.Value;
-            UsmapSchema relevantSchema = this.GetSchemaFromName(schemaName, asset, null, false);
-            while (schemaName != null && relevantSchema != null)
+            foreach (UsmapSchema relevantSchema in this.GetHierarchy(this.GetSchemaFromName(schemaName, asset, null, false), asset, false))
             {
                 propDat = relevantSchema.GetProperty(propertyName.Value.Value, 0)?.PropertyData as T;
                 if (propDat != null) return true;
-                schemaName = relevantSchema.SuperType;
-                relevantSchema = this.GetSchemaFromName(schemaName, asset, null, false);
+            }
+
+            // a map's keys and values carry the map's name, so a container nested in a map finds its type on the map
+            if (ancestry.Parent?.Value?.Value == propertyName.Value?.Value && this.TryGetPropertyData(ancestry.Parent, ancestry.CloneWithoutParent(), asset, out UsmapMapData mapDat))
+            {
+                propDat = (mapDat.ValueType as T) ?? (mapDat.InnerType as T);
+                return propDat != null;
             }
 
             return false;
@@ -1124,6 +1137,23 @@ namespace UAssetAPI.Unversioned
                         {
                             schemaIndexMap[i].ModulePath = reader.ReadName();
                             Schemas[schemaIndexMap[i].ModulePath + "." + schemaIndexMap[i].Name] = schemaIndexMap[i];
+                        }
+
+                        if (reader.BaseStream.Position != endPos) throw new FormatException("Failed to parse extension " + extId + ": ended at " + reader.BaseStream.Position + ", expected " + endPos);
+                        break;
+                    case "GPKG": // Package of each schema and of its parent, for names that several packages share
+                        byte gpkgVer = reader.ReadByte();
+                        if (gpkgVer > 0) break;
+
+                        int gpkgNumSchemas = reader.ReadInt32();
+                        for (int i = 0; i < gpkgNumSchemas; i++)
+                        {
+                            string package = reader.ReadName();
+                            schemaIndexMap[i].SuperTypeModulePath = reader.ReadName();
+                            if (package == null) continue;
+
+                            schemaIndexMap[i].ModulePath = package;
+                            Schemas[package + "." + schemaIndexMap[i].Name] = schemaIndexMap[i];
                         }
 
                         if (reader.BaseStream.Position != endPos) throw new FormatException("Failed to parse extension " + extId + ": ended at " + reader.BaseStream.Position + ", expected " + endPos);
