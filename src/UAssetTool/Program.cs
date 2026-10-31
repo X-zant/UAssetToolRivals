@@ -3602,9 +3602,16 @@ public partial class Program
                             continue;
                         }
                         
-                        var asset = LoadAssetWithMappings(path, mappings);
+                        // The class comes from the export and import maps, so the export data stays unread.
+                        // Only an asset those leave undecided needs its exports parsed.
+                        var asset = new UAsset(path, EngineVersion.VER_UE5_3, mappings, CustomSerializationFlags.SkipLoadingExports);
                         string assetType = DetectAssetType(asset);
-                        
+                        if (assetType == "Unknown")
+                        {
+                            asset = LoadAssetWithMappings(path, mappings);
+                            assetType = DetectAssetType(asset);
+                        }
+
                         results.Add(new Dictionary<string, object?>
                         {
                             ["path"] = path,
