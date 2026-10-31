@@ -3107,26 +3107,19 @@ namespace UAssetAPI
         public static UAsset DeserializeJson(string json)
         {
             Dictionary<FName, string> toBeFilled = new Dictionary<FName, string>();
-            UAsset res = JsonConvert.DeserializeObject<UAsset>(json, new JsonSerializerSettings
+            UAsset res;
+
+            // jsonSettings' resolver keeps its type contracts between reads. A resolver per read
+            // rebuilds them by reflection for every asset, which is slow under NativeAOT.
+            FNameJsonConverter.ThreadNames = toBeFilled;
+            try
             {
-                TypeNameHandling = TypeNameHandling.Objects,
-                NullValueHandling = NullValueHandling.Include,
-                FloatParseHandling = FloatParseHandling.Double,
-                ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-                MetadataPropertyHandling = MetadataPropertyHandling.ReadAhead,
-                ContractResolver = new UAssetContractResolver(toBeFilled),
-                Converters = new List<JsonConverter>()
-                {
-                    new FSignedZeroJsonConverter(),
-                    new FNameJsonConverter(null),
-                    new FStringTableJsonConverter(),
-                    new FStringJsonConverter(),
-                    new FPackageIndexJsonConverter(),
-                    new StringEnumConverter(),
-                    new GuidJsonConverter(),
-                    new ByteArrayJsonConverter()
-                }
-            });
+                res = JsonConvert.DeserializeObject<UAsset>(json, jsonSettings);
+            }
+            finally
+            {
+                FNameJsonConverter.ThreadNames = null;
+            }
 
             foreach (KeyValuePair<FName, string> entry in toBeFilled)
             {
@@ -3169,35 +3162,24 @@ namespace UAssetAPI
         public static UAsset DeserializeJson(Stream stream)
         {
             Dictionary<FName, string> toBeFilled = new Dictionary<FName, string>();
-            var serializer = JsonSerializer.Create(new JsonSerializerSettings
-            {
-                TypeNameHandling = TypeNameHandling.Objects,
-                NullValueHandling = NullValueHandling.Include,
-                FloatParseHandling = FloatParseHandling.Double,
-                ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-                MetadataPropertyHandling = MetadataPropertyHandling.ReadAhead,
-                ContractResolver = new UAssetContractResolver(toBeFilled),
-                Converters = new List<JsonConverter>()
-                {
-                    new FSignedZeroJsonConverter(),
-                    new FNameJsonConverter(null),
-                    new FStringTableJsonConverter(),
-                    new FStringJsonConverter(),
-                    new FPackageIndexJsonConverter(),
-                    new StringEnumConverter(),
-                    new GuidJsonConverter(),
-                    new ByteArrayJsonConverter()
-                }
-            });
+            var serializer = JsonSerializer.Create(jsonSettings);
 
             UAsset res;
 
-            using (var sr = new StreamReader(stream))
+            FNameJsonConverter.ThreadNames = toBeFilled;
+            try
             {
-                using (var jsonTextReader = new JsonTextReader(sr))
+                using (var sr = new StreamReader(stream))
                 {
-                    res = serializer.Deserialize<UAsset>(jsonTextReader);
+                    using (var jsonTextReader = new JsonTextReader(sr))
+                    {
+                        res = serializer.Deserialize<UAsset>(jsonTextReader);
+                    }
                 }
+            }
+            finally
+            {
+                FNameJsonConverter.ThreadNames = null;
             }
 
             foreach (KeyValuePair<FName, string> entry in toBeFilled)
