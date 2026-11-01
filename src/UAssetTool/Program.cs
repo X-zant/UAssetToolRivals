@@ -6885,8 +6885,20 @@ public partial class Program
             // Apply filter patterns if specified
             if (filterPatterns != null && filterPatterns.Count > 0)
             {
+                // Whole paths resolve through the VFS index: testing every package against
+                // every pattern takes minutes once a mod has a thousand assets.
+                var exactIds = new HashSet<ulong>();
+                var partialPatterns = new List<string>();
+                foreach (var pattern in filterPatterns)
+                {
+                    if (context.FindPackageIdByVfsPath(context.ResolveMountToVfsPath(pattern) ?? pattern) is ulong exactId)
+                        exactIds.Add(exactId);
+                    else
+                        partialPatterns.Add(pattern);
+                }
+
                 var filtered = packagesToExtract
-                    .Where(id => filterPatterns.Any(pattern => context.PathMatchesFilter(id, pattern)))
+                    .Where(id => exactIds.Contains(id) || partialPatterns.Any(pattern => context.PathMatchesFilter(id, pattern)))
                     .ToList();
                 packagesToExtract = filtered;
                 Console.Error.WriteLine($"[ExtractIoStoreLegacy] Filtered to {packagesToExtract.Count()} packages matching patterns");
