@@ -9,8 +9,12 @@ namespace UAssetAPI.JSON
 {
     public class FNameJsonConverter : JsonConverter
     {
+        /// <summary>
+        /// The names of the read running on this thread, for a converter shared between reads.
+        /// </summary>
+        [ThreadStatic] internal static Dictionary<FName, string> ThreadNames;
+
         public Dictionary<FName, string> ToBeFilled;
-        public int currentI = 0;
 
         public override bool CanConvert(Type objectType)
         {
@@ -31,8 +35,10 @@ namespace UAssetAPI.JSON
         public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
         {
             if (reader.Value == null) return null;
-            var res = FName.DefineDummy(null, "temp", ++currentI);
-            ToBeFilled[res] = Convert.ToString(reader.Value);
+            var names = ToBeFilled ?? ThreadNames;
+            // Numbered from the list, not the converter: a shared converter runs on several threads at once.
+            var res = FName.DefineDummy(null, "temp", names.Count + 1);
+            names[res] = Convert.ToString(reader.Value);
             return res;
         }
 
