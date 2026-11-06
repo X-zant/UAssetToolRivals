@@ -15,7 +15,7 @@
     <RootNamespace>UAssetTool</RootNamespace>
     <Authors>Xzant</Authors>
     <RepositoryUrl>https://github.com/XzantGaming/UassetToolRivals</RepositoryUrl>
-    <Version>1.5.8</Version>
+    <Version>1.5.9</Version>
   </PropertyGroup>
 
   <ItemGroup>
