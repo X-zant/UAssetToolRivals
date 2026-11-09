@@ -209,6 +209,50 @@ public static class ShaderLibraryConverter
         };
     }
 
+    /// <summary>
+    /// The same library restricted to <paramref name="keepShaderMaps"/> (hex shader map hashes) and the
+    /// shaders they use. Shader entries keep their offsets into the original code section; shader
+    /// indices are renumbered. A cooked library holds every shader map of the cook (the whole project,
+    /// engine content included), while a mod only needs the ones its own packages reference.
+    /// </summary>
+    private static FShaderLibraryHeader FilterHeader(FShaderLibraryHeader h, ISet<string> keepShaderMaps)
+    {
+        var keptMaps = new List<int>();
+        for (int m = 0; m < h.ShaderMapHashes.Length; m++)
+            if (keepShaderMaps.Contains(Convert.ToHexString(h.ShaderMapHashes[m]))) keptMaps.Add(m);
+
+        var newIndexOf = new Dictionary<uint, uint>();
+        var keptShaders = new List<uint>();
+        var indices = new List<uint>();
+        var mapEntries = new List<FShaderMapEntry>();
+        foreach (int m in keptMaps)
+        {
+            var e = h.ShaderMapEntries[m];
+            uint start = (uint)indices.Count;
+            for (uint i = 0; i < e.NumShaders; i++)
+            {
+                uint old = h.ShaderIndices[e.ShaderIndicesOffset + i];
+                if (!newIndexOf.TryGetValue(old, out uint idx))
+                {
+                    idx = (uint)keptShaders.Count;
+                    newIndexOf[old] = idx;
+                    keptShaders.Add(old);
+                }
+                indices.Add(idx);
+            }
+            mapEntries.Add(new FShaderMapEntry { ShaderIndicesOffset = start, NumShaders = e.NumShaders });
+        }
+        return new FShaderLibraryHeader
+        {
+            ShaderMapHashes = keptMaps.Select(m => h.ShaderMapHashes[m]).ToArray(),
+            ShaderHashes = keptShaders.Select(s => h.ShaderHashes[s]).ToArray(),
+            ShaderMapEntries = mapEntries.ToArray(),
+            ShaderEntries = keptShaders.Select(s => h.ShaderEntries[s]).ToArray(),
+            PreloadEntries = Array.Empty<FFileCachePreloadEntry>(),   // not used by the IoStore format
+            ShaderIndices = indices.ToArray(),
+        };
+    }
+
     #endregion
 
     #region Shader Grouping (retoc algorithm)
@@ -400,6 +444,50 @@ public static class ShaderLibraryConverter
 
     #endregion
 
+    #region Package Shader Map Associations
+
+    /// <summary>
+    /// Which shader maps a cooked package uses, for the package store entries' ShaderMapHashes (the async loader
+    /// preloads exactly these before the package's exports: AsyncLoading2.cpp, PreloadPackageShaderMaps).
+    ///
+    /// Stock IoStoreUtilities takes them from the cooker's ShaderAssetInfo json, which UE's packaging does not put into
+    /// .pak files. A cooked material resource stores its shader map hash (the library key, 20 bytes) inline, so every
+    /// library map hash found in the package's bytes is one it uses.
+    /// </summary>
+    /// <returns>All shader map hashes of the given libraries: the candidates for <see cref="FindShaderMapsInPackage"/>.</returns>
+    public static List<byte[]> ShaderMapsOfLibraries(IEnumerable<string> shaderLibraryFiles)
+    {
+        var hashes = new List<byte[]>();
+        foreach (var libraryFile in shaderLibraryFiles)
+        {
+            if (!libraryFile.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase)) continue;
+            using var reader = new BinaryReader(File.OpenRead(libraryFile));
+            if (reader.ReadInt32() != SHADER_LIBRARY_VERSION) continue;
+            hashes.AddRange(ReadLegacyHeader(reader).ShaderMapHashes);
+        }
+        return hashes;
+    }
+
+    /// <summary>The shader maps (of <paramref name="candidates"/>) whose hash occurs in the package's bytes, sorted as stock sorts them.</summary>
+    public static List<byte[]> FindShaderMapsInPackage(string uassetPath, IReadOnlyList<byte[]> candidates)
+    {
+        var found = new List<byte[]>();
+        if (candidates.Count == 0) return found;
+        foreach (var path in new[] { Path.ChangeExtension(uassetPath, ".uexp"), uassetPath })
+        {
+            if (!File.Exists(path)) continue;
+            var bytes = File.ReadAllBytes(path);
+            foreach (var h in candidates)
+                if (!found.Any(f => f.AsSpan().SequenceEqual(h)) && bytes.AsSpan().IndexOf(h) >= 0) found.Add(h);
+        }
+        found.Sort((a, b) => a.AsSpan().SequenceCompareTo(b));
+        if (found.Count > 0)
+            Console.Error.WriteLine($"[ShaderLib] {Path.GetFileNameWithoutExtension(uassetPath)}: {found.Count} shader map(s) ({string.Join(", ", found.Select(h => Convert.ToHexString(h)[..8]))})");
+        return found;
+    }
+
+    #endregion
+
     #region Main Conversion
 
     /// <summary>
@@ -408,7 +496,8 @@ public static class ShaderLibraryConverter
     /// <param name="ushaderbytecodeData">Raw bytes of the .ushaderbytecode file</param>
     /// <param name="shaderLibraryPath">UE path, e.g. "Marvel/Content/ShaderArchive-Marvel_Chunk0-PCD3D_SM6-PCD3D_SM6.ushaderbytecode"</param>
     /// <param name="writer">IoStoreWriter to write chunks into</param>
-    public static void ConvertAndWrite(byte[] ushaderbytecodeData, string shaderLibraryPath, IoStoreWriter writer)
+    /// <param name="keepShaderMaps">When given, only these shader maps (hex hashes) and their shaders are written.</param>
+    public static void ConvertAndWrite(byte[] ushaderbytecodeData, string shaderLibraryPath, IoStoreWriter writer, ISet<string>? keepShaderMaps = null)
     {
         using var ms = new MemoryStream(ushaderbytecodeData);
         using var reader = new BinaryReader(ms);
@@ -421,6 +510,12 @@ public static class ShaderLibraryConverter
         // Read legacy header
         var header = ReadLegacyHeader(reader);
         long shaderCodeStartOffset = ms.Position;
+        if (keepShaderMaps != null)
+        {
+            int before = header.ShaderMapHashes.Length, shadersBefore = header.ShaderHashes.Length;
+            header = FilterHeader(header, keepShaderMaps);
+            Console.Error.WriteLine($"[ShaderLib] Keeping the {header.ShaderMapHashes.Length} of {before} shader maps the packaged packages use ({header.ShaderHashes.Length} of {shadersBefore} shaders)");
+        }
 
         Console.Error.WriteLine($"[ShaderLib] Parsing {shaderLibraryPath}: {header.ShaderHashes.Length} shaders, {header.ShaderMapHashes.Length} shader maps");
 
@@ -657,11 +752,15 @@ public static class ShaderLibraryConverter
         // Create the ShaderCodeLibrary chunk ID
         var libraryChunkId = FIoChunkId.CreateShaderLibraryChunkId(libraryName, formatName);
 
-        // Write with directory index path (strip .ushaderbytecode extension for the path)
-        string libraryPathNoExt = shaderLibraryPath;
-        if (libraryPathNoExt.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase))
-            libraryPathNoExt = libraryPathNoExt.Substring(0, libraryPathNoExt.Length - ".ushaderbytecode".Length);
-        writer.WriteChunk(libraryChunkId, libraryPathNoExt, headerData);
+        // The directory index keeps the .ushaderbytecode extension. Stock UnrealPak writes the
+        // cooked file's own path (IoStoreUtilities.cpp: WriteOptions.FileName = DestinationPath),
+        // and the game's pakchunkShaderAsset lists
+        // ../../../Marvel/Content/ShaderArchive-Marvel_Chunk0-PCD3D_SM6-PCD3D_SM6.ushaderbytecode.
+        // retoc strips it; anything that finds libraries by file name would then miss ours.
+        string libraryPath = shaderLibraryPath.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase)
+            ? shaderLibraryPath
+            : shaderLibraryPath + ".ushaderbytecode";
+        writer.WriteChunk(libraryChunkId, libraryPath, headerData);
 
         // Stats
         long totalCompressedLegacy = ushaderbytecodeData.Length - shaderCodeStartOffset;
