@@ -24,3 +24,5 @@ Thumbs.db
 # NuGet
 packages/
 *.nupkg
+
+__pycache__/

@@ -972,6 +972,9 @@ public partial class Program
             var filePaths = new List<string>();
             int convertedCount = 0;
             var errors = new List<string>();
+            var libraryShaderMaps = IoStore.ShaderLibraryConverter.ShaderMapsOfLibraries(shaderBytecodeFiles);
+            // Shader maps the packaged packages use: a cooked library holds the whole cook's, a mod ships only these.
+            HashSet<string>? usedShaderMaps = null;
 
             foreach (var result in conversionResults)
             {
@@ -1009,6 +1012,14 @@ public partial class Program
                     foreach (ulong importedPkgId in zenPackage.ImportedPackages)
                     {
                         storeEntry.ImportedPackages.Add(new IoStore.FPackageId(importedPkgId));
+                    }
+                    // The shader maps this package uses (from its own bytes: packaging does not put the cooker's asset info into .pak files)
+                    var shaderMapHashes = IoStore.ShaderLibraryConverter.FindShaderMapsInPackage(uassetPath, libraryShaderMaps);
+                    if (shaderMapHashes.Count > 0)
+                    {
+                        storeEntry.ShaderMapHashes.AddRange(shaderMapHashes);
+                        usedShaderMaps ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var h in shaderMapHashes) usedShaderMaps.Add(Convert.ToHexString(h));
                     }
 
                     // Write to IoStore. Preserve the package extension: a level package is .umap, not .uasset.
@@ -1065,7 +1076,7 @@ public partial class Program
                 {
                     byte[] shaderData = File.ReadAllBytes(shaderFile);
                     string shaderLibPath = mountPoint + gamePathPrefix + Path.GetFileName(shaderFile);
-                    IoStore.ShaderLibraryConverter.ConvertAndWrite(shaderData, shaderLibPath, ioStoreWriter);
+                    IoStore.ShaderLibraryConverter.ConvertAndWrite(shaderData, shaderLibPath, ioStoreWriter, usedShaderMaps);
                     filePaths.Add(gamePathPrefix + Path.GetFileName(shaderFile));
                     shaderLibsConverted++;
                 }
@@ -7282,7 +7293,10 @@ public partial class Program
             var filePaths = new List<string>();
             int converted = 0;
             var errors = new List<string>();
-            
+            var libraryShaderMaps = IoStore.ShaderLibraryConverter.ShaderMapsOfLibraries(shaderFiles);
+            // Shader maps the packaged packages use: a cooked library holds the whole cook's, a mod ships only these.
+            HashSet<string>? usedShaderMaps = null;
+
             foreach (var result in conversionResults)
             {
                 if (result.error != null || result.zenData == null)
@@ -7311,12 +7325,20 @@ public partial class Program
                         ExportBundleCount = 1,
                         LoadOrder = 0
                     };
-                    
+
                     foreach (ulong importedPkgId in zenPackage.ImportedPackages)
                     {
                         storeEntry.ImportedPackages.Add(new IoStore.FPackageId(importedPkgId));
                     }
-                    
+                    // The shader maps this package uses (from its own bytes: packaging does not put the cooker's asset info into .pak files)
+                    var shaderMapHashes = IoStore.ShaderLibraryConverter.FindShaderMapsInPackage(uassetPath, libraryShaderMaps);
+                    if (shaderMapHashes.Count > 0)
+                    {
+                        storeEntry.ShaderMapHashes.AddRange(shaderMapHashes);
+                        usedShaderMaps ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var h in shaderMapHashes) usedShaderMaps.Add(Convert.ToHexString(h));
+                    }
+
                     // Write to IoStore. Preserve the package extension: a level package is .umap, not .uasset.
                     string pkgExt = uassetPath.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? ".umap" : ".uasset";
                     string fullPath = mount + packagePath + pkgExt;
@@ -7378,13 +7400,12 @@ public partial class Program
                     else
                         shaderLibPath = mount + "Marvel/Content/" + relativePath;
                     
-                    IoStore.ShaderLibraryConverter.ConvertAndWrite(shaderData, shaderLibPath, ioStoreWriter);
+                    IoStore.ShaderLibraryConverter.ConvertAndWrite(shaderData, shaderLibPath, ioStoreWriter, usedShaderMaps);
                     
-                    // Add shader library path to chunknames (without extension, matching retoc behavior)
-                    string relNoExt = relativePath;
-                    if (relNoExt.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase))
-                        relNoExt = relNoExt.Substring(0, relNoExt.Length - ".ushaderbytecode".Length);
-                    filePaths.Add(relNoExt + ".ushaderbytecode");
+                    // Add shader library path to chunknames, extension included (as the directory index has it)
+                    filePaths.Add(relativePath.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase)
+                        ? relativePath
+                        : relativePath + ".ushaderbytecode");
                     
                     shaderLibsConverted++;
                     Console.Error.WriteLine($"[CreateModIoStore] Converted shader library: {Path.GetFileName(shaderFile)}");
