@@ -121,9 +121,6 @@ UAssetTool create_mod_iostore "output/MyMod" \
 # From a directory (recursively finds all .uasset files)
 UAssetTool create_mod_iostore "output/MyMod" "Content/Marvel/Characters/1014/"
 
-# With obfuscation (protects from FModel extraction)
-UAssetTool create_mod_iostore "output/MyMod" --obfuscate "my_mod.pak"
-
 # Without compression (faster, larger files)
 UAssetTool create_mod_iostore "output/MyMod" --no-compress "my_mod.pak"
 
@@ -137,17 +134,30 @@ UAssetTool create_mod_iostore "output/MyMod" --hybrid "my_mixed_mod.pak"
 - `--mount-point <path>` - Mount point (default: `../../../`)
 - `--game-path <prefix>` - Game path prefix (default: `Marvel/Content/`)
 - `--compress` / `--no-compress` - Toggle Oodle compression (default: enabled)
-- `--obfuscate` - Encrypt with game's AES key to prevent FModel extraction
 - `--pak-aes <hex>` - AES key for decrypting encrypted input `.pak` files
 - `--no-material-tags` - Disable automatic MaterialTag injection
 - `--hybrid` - Embed non-Unreal files as loose entries in the companion PAK instead of dropping them (see below)
 
-**Hybrid bundles:** By default `create_mod_iostore` only handles the Unreal family (`.uasset`, `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.ushaderbytecode`) and silently skips everything else. With `--hybrid`, any other file found in the input PAK/folder (e.g. `.bnk`/`.wem` audio, raw `.png`, `.bin`) is written into the companion PAK at its original relative path so the game mounts it directly. Raw files are not listed in `chunknames`.
+**Hybrid bundles:** By default `create_mod_iostore` only handles the Unreal family (`.uasset`, `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.ushaderbytecode`) and silently skips everything else. With `--hybrid`, any other file found in the input PAK/folder (e.g. `.bnk`/`.wem` audio, raw `.png`, `.bin`) is written into the companion PAK at its original relative path so the game mounts it directly.
 
 **Output files** (copy all three to `~mods`):
 - `<output>.utoc` - Table of Contents
 - `<output>.ucas` - Container Archive Store
-- `<output>.pak` - Companion PAK with chunk names (and, in hybrid mode, loose non-Unreal files)
+- `<output>.pak` - Companion PAK the container is mounted through. Empty, like the game's own companion paks, apart from loose non-Unreal files in hybrid mode. No `chunknames` manifest is written.
+
+Output is never encrypted. Obfuscated mods built by older versions still read everywhere, and `deobfuscate_iostore` turns one into a plain mod in place (see below).
+
+### Reverting obfuscation
+
+```bash
+# Decrypt in place (atomic: the originals are only replaced once everything succeeded)
+UAssetTool deobfuscate_iostore "~mods/MyMod_P.utoc"
+
+# Or write plain copies and leave the originals alone
+UAssetTool deobfuscate_iostore "~mods/MyMod_P.utoc" --output "plain/MyMod_P"
+```
+
+Obfuscation only ever padded each compression block to 16 bytes, encrypted it where it sat, and set the `.utoc`'s Encrypted flag. The block table records each block's real size, so decrypting every block in place and clearing the flag gives back a plain container, with no extraction, no recompression and no repackaging: one pass over the `.ucas`, well under a second for a typical mod. The companion `.pak` needs no change. A wrong `--aes` key is caught before anything is written, by decompressing one block. Running it on a plain container does nothing.
 
 **Marvel Rivals auto-fixes applied during conversion:**
 - **SkeletalMesh**: FGameplayTagContainer padding, MaterialTag injection
@@ -591,13 +601,14 @@ UAssetTool extract_script_objects <paks_path> <output_file>
 UAssetTool recompress_iostore <utoc_path>
 UAssetTool is_iostore_compressed <utoc_path>
 UAssetTool is_iostore_encrypted <utoc_path>
+UAssetTool deobfuscate_iostore <utoc_path> [--output <base>] [--aes <hex>]
 UAssetTool clone_mod_iostore <utoc_path> <output_base>
 UAssetTool cityhash <path_string>
 UAssetTool dump_zen_from_game <paks_path> <package_path> [output_file]
 
 # Additional IoStore bundle creation
 UAssetTool create_iostore_bundle <output> <files...>
-UAssetTool create_companion_pak <output.pak> <files...>
+UAssetTool create_companion_pak <output.pak> [--mount-point <path>]
 ```
 
 ---
@@ -684,7 +695,8 @@ The `batch_extract_texture_png` action processes all files in `file_paths`, outp
 
 **Mod Creation**
 ```json
-{"action": "create_mod_iostore", "output_path": "...", "input_dir": "...", "usmap_path": "...", "obfuscate": true}
+{"action": "create_mod_iostore", "output_path": "...", "input_dir": "..."}
+{"action": "deobfuscate_iostore", "file_path": "MyMod_P.utoc", "output_path": "optional/plain/MyMod_P"}
 {"action": "create_mod_iostore", "output_path": "...", "input_pak": "...", "hybrid": true}
 {"action": "clone_mod_iostore", "file_path": "...", "output_path": "..."}
 ```

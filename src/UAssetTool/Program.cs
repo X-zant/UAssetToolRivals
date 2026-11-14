@@ -63,6 +63,7 @@ public partial class Program
                 "extract_iostore_legacy" => CliExtractIoStoreLegacy(args),
                 "is_iostore_compressed" => CliIsIoStoreCompressed(args),
                 "is_iostore_encrypted" => CliIsIoStoreEncrypted(args),
+                "deobfuscate_iostore" => CliDeobfuscateIoStore(args),
                 "extract_script_objects" => CliExtractScriptObjects(args),
                 "recompress_iostore" => CliRecompressIoStore(args),
                 "cityhash" => CliCityHash(args),
@@ -186,7 +187,7 @@ public partial class Program
         Console.WriteLine("    create_mod_iostore <output> <inputs...>  - Convert legacy assets and create IoStore bundle (add --hybrid to embed non-Unreal files in the companion PAK)");
         Console.WriteLine("    to_zen <uasset> [--no-material-tags] - Convert legacy to Zen format");
         Console.WriteLine("    create_pak <output.pak> <files...>       - Create encrypted PAK file");
-        Console.WriteLine("    create_companion_pak <output.pak> <files...> - Create companion PAK for IoStore");
+        Console.WriteLine("    create_companion_pak <output.pak> [options] - Create an (empty) companion PAK for IoStore");
         Console.WriteLine("    create_iostore_bundle <output> <files...> - Create complete IoStore bundle");
         Console.WriteLine();
         Console.WriteLine("  Extraction:");
@@ -198,6 +199,7 @@ public partial class Program
         Console.WriteLine("  IoStore Utilities:");
         Console.WriteLine("    inspect_zen <zen_asset_path>             - Inspect Zen package structure");
         Console.WriteLine("    is_iostore_compressed <utoc_path>        - Check if IoStore is compressed");
+        Console.WriteLine("    deobfuscate_iostore <utoc> [--output <base>] - Decrypt an obfuscated mod in place, no repack");
         Console.WriteLine("    recompress_iostore <utoc_path>           - Recompress IoStore with Oodle");
         Console.WriteLine("    cityhash <path_string>                   - Calculate CityHash64 for a path");
         Console.WriteLine("    clone_mod_iostore <utoc> <output>        - Clone/repackage a mod IoStore");
@@ -454,11 +456,11 @@ public partial class Program
 
     private static int CliCreateCompanionPak(string[] args)
     {
-        if (args.Length < 3)
+        if (args.Length < 2)
         {
-            Console.Error.WriteLine("Usage: UAssetTool create_companion_pak <output.pak> <file_path1> [file_path2] ...");
-            Console.Error.WriteLine("  Creates a companion PAK file for IoStore bundles.");
-            Console.Error.WriteLine("  The PAK contains a 'chunknames' entry listing all provided file paths.");
+            Console.Error.WriteLine("Usage: UAssetTool create_companion_pak <output.pak> [options]");
+            Console.Error.WriteLine("  Creates the companion PAK an IoStore bundle is mounted through. It holds no entries:");
+            Console.Error.WriteLine("  the game's own companions are empty paks, and no chunknames manifest is written.");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Options:");
             Console.Error.WriteLine("  --mount-point <path>  - Mount point (default: ../../../)");
@@ -471,7 +473,7 @@ public partial class Program
         string mountPoint = "../../../";
         ulong pathHashSeed = 0;
         string? aesKey = null;
-        var filePaths = new List<string>();
+        int ignoredPaths = 0;
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -489,22 +491,19 @@ public partial class Program
             }
             else
             {
-                // Add as a file path (doesn't need to exist - just a path string)
-                filePaths.Add(args[i]);
+                // File paths used to feed the chunknames manifest, which is no longer written.
+                // Accept them so existing scripts keep working.
+                ignoredPaths++;
             }
         }
 
-        if (filePaths.Count == 0)
-        {
-            Console.Error.WriteLine("Error: No file paths provided");
-            return 1;
-        }
+        if (ignoredPaths > 0)
+            Console.Error.WriteLine($"Note: {ignoredPaths} file path argument(s) ignored; companion PAKs no longer carry a chunknames list.");
 
         try
         {
-            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey);
+            IoStore.CompanionPakWriter.Create(outputPath, mountPoint, pathHashSeed, aesKey);
             Console.WriteLine($"SUCCESS: Created companion PAK at {outputPath}");
-            Console.WriteLine($"  Files listed: {filePaths.Count}");
             return 0;
         }
         catch (Exception ex)
@@ -599,7 +598,6 @@ public partial class Program
                 enableEncryption,
                 aesKey);
 
-            var filePaths = new List<string>();
 
             foreach (var (relPath, absPath) in files)
             {
@@ -626,7 +624,6 @@ public partial class Program
 
                 string gamePath = mountPoint + relPath;
                 ioStoreWriter.WritePackageChunk(chunkId, gamePath, data, storeEntry);
-                filePaths.Add(relPath);
 
                 Console.Error.WriteLine($"  Added: {relPath} ({data.Length} bytes)");
             }
@@ -634,7 +631,7 @@ public partial class Program
             ioStoreWriter.Complete();
 
             // Create companion PAK
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mountPoint, 0, aesKey);
+            IoStore.CompanionPakWriter.Create(pakPath, mountPoint, 0, aesKey);
 
             Console.WriteLine($"SUCCESS: Created IoStore bundle:");
             Console.WriteLine($"  {utocPath}");
@@ -683,7 +680,6 @@ public partial class Program
             Console.Error.WriteLine("  --game-path <prefix>  - Game path prefix (default: Marvel/Content/)");
             Console.Error.WriteLine("  --compress            - Enable Oodle compression (default: enabled)");
             Console.Error.WriteLine("  --no-compress         - Disable compression");
-            Console.Error.WriteLine("  --obfuscate           - Protect mod from extraction tools like FModel");
             Console.Error.WriteLine("  --pak-aes <hex>       - AES key for decrypting input .pak files");
             Console.Error.WriteLine("  --no-material-tags    - Disable MaterialTag injection (enabled by default)");
             Console.Error.WriteLine("  --hybrid              - Embed non-Unreal files (audio, raw .png, .bin, ...) as");
@@ -695,11 +691,7 @@ public partial class Program
         string mountPoint = "../../../";
         string gamePathPrefix = "Marvel/Content/";
         bool enableCompression = true;
-        bool enableEncryption = false;
-        string? aesKey = null;
         string? pakAesKey = null;
-        // Marvel Rivals AES key for obfuscation
-        const string MARVEL_RIVALS_AES_KEY = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
         // Pre-scan for --hybrid so it applies no matter where it appears relative to inputs
         // (inputs are processed inline as the arg loop encounters them).
         bool hybrid = args.Any(a => a.Equals("--hybrid", StringComparison.OrdinalIgnoreCase));
@@ -731,11 +723,6 @@ public partial class Program
             else if (args[i] == "--no-compress")
             {
                 enableCompression = false;
-            }
-            else if (args[i] == "--obfuscate")
-            {
-                enableEncryption = true;
-                aesKey = MARVEL_RIVALS_AES_KEY;
             }
             else if (args[i] == "--pak-aes" && i + 1 < args.Length)
             {
@@ -910,7 +897,6 @@ public partial class Program
             if (shaderBytecodeFiles.Count > 0)
                 Console.Error.WriteLine($"[CreateModIoStore]   Shader Libraries: {shaderBytecodeFiles.Count}");
             Console.Error.WriteLine($"[CreateModIoStore]   Compression: {(enableCompression ? "Oodle" : "None")}");
-            Console.Error.WriteLine($"[CreateModIoStore]   Protection: {(enableEncryption ? "Obfuscated (FModel-proof)" : "None")}");
 
             // Phase 1: Parallel conversion to Zen format (CPU-intensive)
             // This is the bottleneck - UAsset parsing, NameMap building, export reordering, hashing
@@ -965,9 +951,7 @@ public partial class Program
                 IoStore.EIoStoreTocVersion.PerfectHashWithOverflow,
                 IoStore.EIoContainerHeaderVersion.NoExportInfo,
                 mountPoint,
-                enableCompression,
-                enableEncryption,
-                aesKey);
+                enableCompression);
 
             var filePaths = new List<string>();
             int convertedCount = 0;
@@ -1112,8 +1096,8 @@ public partial class Program
                 }
             }
 
-            // Create companion PAK (with chunknames and any hybrid raw files)
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mountPoint, 0, aesKey, rawEntries.Count > 0 ? rawEntries : null);
+            // Create the companion PAK: empty, apart from any hybrid raw files.
+            IoStore.CompanionPakWriter.Create(pakPath, mountPoint, 0, null, rawEntries.Count > 0 ? rawEntries : null);
 
             Console.WriteLine($"SUCCESS: Created IoStore mod bundle:");
             Console.WriteLine($"  {utocPath}");
@@ -1281,6 +1265,86 @@ public partial class Program
     /// <summary>
     /// Check if an IoStore container is encrypted (obfuscated).
     /// </summary>
+    /// <summary>
+    /// Turn an obfuscated IoStore mod back into a plain one by decrypting its blocks in place.
+    /// No extraction and no repackaging: see IoStoreDeobfuscator for why that is enough.
+    /// </summary>
+    private static int CliDeobfuscateIoStore(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool deobfuscate_iostore <utoc_path> [--output <base_path>] [--aes <hex>]");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Decrypts an obfuscated mod's .ucas blocks where they sit and clears the .utoc's");
+            Console.Error.WriteLine("Encrypted flag. The companion .pak needs no change. Nothing is extracted or");
+            Console.Error.WriteLine("recompressed. Without --output the files are replaced in place, atomically.");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("  --output <base>  - Write <base>.utoc/.ucas/.pak instead and leave the originals alone");
+            Console.Error.WriteLine("  --aes <hex>      - AES key (default: Marvel Rivals)");
+            return 1;
+        }
+
+        string utocPath = args[1];
+        string? outputBase = null;
+        string? aesKey = null;
+        for (int i = 2; i < args.Length; i++)
+        {
+            if (args[i] == "--output" && i + 1 < args.Length) outputBase = args[++i];
+            else if ((args[i] == "--aes" || args[i] == "--aes-key") && i + 1 < args.Length) aesKey = args[++i];
+            else { Console.Error.WriteLine($"Unknown option: {args[i]}"); return 1; }
+        }
+        if (outputBase != null && outputBase.EndsWith(".utoc", StringComparison.OrdinalIgnoreCase))
+            outputBase = outputBase[..^5];
+
+        try
+        {
+            var result = IoStore.IoStoreDeobfuscator.Deobfuscate(utocPath, outputBase, aesKey);
+            Console.WriteLine(result.Message);
+            if (result.WasEncrypted)
+            {
+                Console.WriteLine($"  {result.UtocPath}");
+                Console.WriteLine($"  {result.UcasPath}");
+                if (result.PakPath != null) Console.WriteLine($"  {result.PakPath}");
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static UAssetResponse DeobfuscateIoStoreJson(string? utocPath, string? outputPath, string? aesKey)
+    {
+        if (string.IsNullOrEmpty(utocPath))
+            return new UAssetResponse { Success = false, Message = "file_path (the .utoc) is required" };
+        try
+        {
+            string? outputBase = string.IsNullOrEmpty(outputPath) ? null
+                : outputPath.EndsWith(".utoc", StringComparison.OrdinalIgnoreCase) ? outputPath[..^5] : outputPath;
+            var result = IoStore.IoStoreDeobfuscator.Deobfuscate(utocPath, outputBase, aesKey);
+            return new UAssetResponse
+            {
+                Success = true,
+                Message = result.Message,
+                Data = new Dictionary<string, object?>
+                {
+                    ["was_encrypted"] = result.WasEncrypted,
+                    ["blocks_decrypted"] = result.BlocksDecrypted,
+                    ["directory_index_decrypted"] = result.DirectoryIndexDecrypted,
+                    ["utoc_path"] = result.UtocPath,
+                    ["ucas_path"] = result.UcasPath,
+                    ["pak_path"] = result.PakPath,
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new UAssetResponse { Success = false, Message = ex.Message };
+        }
+    }
+
     private static int CliIsIoStoreEncrypted(string[] args)
     {
         if (args.Length < 2)
@@ -2803,11 +2867,12 @@ public partial class Program
                 "version" => GetVersionJson(),
                 "is_iostore_compressed" => IsIoStoreCompressed(request.FilePath),
                 "is_iostore_encrypted" => IsIoStoreEncrypted(request.FilePath),
+                "deobfuscate_iostore" => DeobfuscateIoStoreJson(request.FilePath, request.OutputPath, request.AesKey),
                 "recompress_iostore" => RecompressIoStore(request.FilePath),
                 "extract_iostore" => ExtractIoStoreJson(request.FilePath, request.OutputPath, request.AesKey),
                 "extract_iostore_legacy" => ExtractIoStoreLegacyJson(request.GamePaks, request.ModPath, request.OutputPath, request.FilterPatterns, request.AesKey, request.WithDeps),
                 "extract_script_objects" => ExtractScriptObjectsJson(request.FilePath, request.OutputPath),
-                "create_mod_iostore" => CreateModIoStoreJson(request.OutputPath, request.InputDir, request.InputPak, request.MountPoint, request.Compress, request.AesKey, request.Parallel, request.Obfuscate, request.Hybrid),
+                "create_mod_iostore" => CreateModIoStoreJson(request.OutputPath, request.InputDir, request.InputPak, request.MountPoint, request.Compress, request.AesKey, request.Parallel, request.Hybrid),
                 
                 // Additional CLI-equivalent operations for parity
                 "dump" => DumpAssetJson(request.FilePath, request.UsmapPath),
@@ -5630,7 +5695,6 @@ public partial class Program
                 false, // no encryption
                 null);
 
-            var filePaths = new List<string>();
             int successCount = 0;
 
             foreach (var packagePath in packagePaths)
@@ -5689,8 +5753,6 @@ public partial class Program
 
                             string fullPath = mountPoint + filePath + ".uasset";
                             ioStoreWriter.WritePackageChunk(chunkId, fullPath, zenData, storeEntry);
-                            filePaths.Add(filePath + ".uasset");
-                            filePaths.Add(filePath + ".uexp");
 
                             // Check for BulkData chunk
                             var bulkChunkId = IoStore.FIoChunkId.FromPackageId(packageId, 0, IoStore.EIoChunkType.BulkData);
@@ -5699,7 +5761,6 @@ public partial class Program
                                 byte[] bulkData = reader.ReadChunk(bulkChunkId);
                                 string bulkFullPath = mountPoint + filePath + ".ubulk";
                                 ioStoreWriter.WriteChunk(bulkChunkId, bulkFullPath, bulkData);
-                                filePaths.Add(filePath + ".ubulk");
                                 Console.Error.WriteLine($"    BulkData: {bulkData.Length} bytes");
                             }
 
@@ -5725,7 +5786,7 @@ public partial class Program
             ioStoreWriter.Complete();
 
             // Create companion PAK with chunk names
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mountPoint, 0, null);
+            IoStore.CompanionPakWriter.Create(pakPath, mountPoint, 0, null);
 
             Console.Error.WriteLine();
             Console.Error.WriteLine($"SUCCESS: Created IoStore mod bundle:");
@@ -6329,23 +6390,21 @@ public partial class Program
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
-        if (filePaths == null || filePaths.Count == 0)
-            return new UAssetResponse { Success = false, Message = "File paths are required" };
-        
+
         try
         {
             mountPoint ??= "../../../";
-            
-            IoStore.ChunkNamesPakWriter.Create(outputPath, filePaths, mountPoint, pathHashSeed, aesKey);
-            
+
+            // file_paths used to feed the chunknames manifest, which is no longer written.
+            IoStore.CompanionPakWriter.Create(outputPath, mountPoint, pathHashSeed, aesKey);
+
             return new UAssetResponse
             {
                 Success = true,
-                Message = $"Created companion PAK listing {filePaths.Count} files",
+                Message = "Created companion PAK",
                 Data = new Dictionary<string, object?>
                 {
-                    ["output_path"] = outputPath,
-                    ["file_count"] = filePaths.Count
+                    ["output_path"] = outputPath
                 }
             };
         }
@@ -7106,19 +7165,13 @@ public partial class Program
     /// Converts .uasset/.uexp files to Zen format and creates .utoc/.ucas/.pak bundle.
     /// Supports direct .pak file input (input_pak) as an alternative to input_dir.
     /// </summary>
-    public static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate, bool hybrid = false)
+    public static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool hybrid = false)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
 
-        // Marvel Rivals AES key for obfuscation
-        const string MARVEL_RIVALS_AES_KEY = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
-
-        // Separate keys: input PAK reading vs output IoStore encryption.
-        // The caller may provide aesKey purely to read an encrypted input PAK, even when
-        // they don't want the output IoStore to be encrypted.
-        string? inputPakAesKey = aesKey;  // Used only to read input PAK
-        string? outputEncryptionKey = obfuscate ? MARVEL_RIVALS_AES_KEY : null;  // Used to encrypt output
+        // aesKey only ever decrypts an encrypted input PAK. Output is never encrypted.
+        string? inputPakAesKey = aesKey;
 
         string? effectiveInputDir = inputDir;
         string? tempExtractDir = null;
@@ -7278,17 +7331,13 @@ public partial class Program
             Console.Error.WriteLine($"[CreateModIoStore] Parallel conversion done. Writing IoStore...");
             Console.Error.Flush();
             
-            // Phase 2: Sequential write to IoStore.
-            // Only encrypt the output IoStore when obfuscation is explicitly requested.
-            // Do NOT encrypt just because aesKey was passed (it may be for reading input PAK only).
+            // Phase 2: Sequential write to IoStore. Output is never encrypted.
             using var ioStoreWriter = new IoStore.IoStoreWriter(
                 utocPath,
                 IoStore.EIoStoreTocVersion.PerfectHashWithOverflow,
                 IoStore.EIoContainerHeaderVersion.NoExportInfo,
                 mount,
-                compress,
-                obfuscate,
-                outputEncryptionKey);
+                compress);
             
             var filePaths = new List<string>();
             int converted = 0;
@@ -7448,7 +7497,7 @@ public partial class Program
             }
 
             // Create companion PAK with chunknames (and any hybrid raw files).
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, mount, 0, aesKey, rawEntries.Count > 0 ? rawEntries : null);
+            IoStore.CompanionPakWriter.Create(pakPath, mount, 0, null, rawEntries.Count > 0 ? rawEntries : null);
             
             // Resolve file paths to Marvel/Content/ format for the app
             var resolvedFilePaths = filePaths.Select(p => ResolveGamePathToContent(p)).ToList();
@@ -7575,7 +7624,7 @@ public partial class Program
             ioStoreWriter.Complete();
             
             // Create companion PAK
-            IoStore.ChunkNamesPakWriter.Create(pakPath, filePaths, "../../../", 0, aesKey);
+            IoStore.CompanionPakWriter.Create(pakPath, "../../../", 0, aesKey);
             
             return new UAssetResponse
             {
@@ -7678,11 +7727,6 @@ public class UAssetRequest
     [JsonPropertyName("parallel")]
     public bool Parallel { get; set; } = false;
     
-    /// <summary>
-    /// Enable obfuscation (encrypts with game's AES key to block extraction tools like FModel)
-    /// </summary>
-    [JsonPropertyName("obfuscate")]
-    public bool Obfuscate { get; set; } = false;
 
     /// <summary>
     /// Hybrid bundle: route Unreal assets into the IoStore (.ucas) as usual, but embed any
