@@ -58,6 +58,9 @@ public class ArrayPropertyData : PropertyData<PropertyData[]>
         }
 
         int numEntries = reader.ReadInt32();
+        // A wrong usmap misaligns the read and yields a garbage count; fail before allocating gigabytes for it
+        if (numEntries < 0 || numEntries > reader.BaseStream.Length - reader.BaseStream.Position)
+            throw new FormatException($"Invalid array length {numEntries} for {Name?.Value?.Value}");
         if (ArrayType.Value.Value == "StructProperty" && ShouldSerializeStructsDifferently && !reader.Asset.HasUnversionedProperties)
         {
             var results = new PropertyData[numEntries];
